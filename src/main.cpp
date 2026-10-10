@@ -1,5 +1,6 @@
 // OpenDash-аналог для CYD: Ninebot G30 / ES4, BLE, только чтение телеметрии.
-// Кнопка BOOT (GPIO0): короткое нажатие - следующая страница, долгое (>1.5 c) - переподключение.
+// Управление: сенсорный экран (свайп - страницы, шестерёнка - настройки) и кнопка BOOT (GPIO0):
+// короткое нажатие - следующая страница / назад, долгое (>1.5 c) - переподключение.
 // Страницы: 0 - панель со спидометром, 1 - информация, 2 - отладка.
 
 #include <Arduino.h>
@@ -8,13 +9,17 @@
 #include <mbedtls/aes.h>
 #include <mbedtls/sha1.h>
 #include <cstring>
+#include <SPI.h>
+#include <Preferences.h>
+#include <XPT2046_Touchscreen.h>
+#include "ru_fonts.h"   // кириллица для TFT_eSPI (генерируется tools/gen_ru_font.py)
 
 // ---------- Настройки ----------
 #define BTN_PIN        0
 #define TARGET_NAME    ""      // "" = первый найденный Ninebot; иначе точное имя, напр. "NBScooter1234"
 #define POLL_INTERVAL  400     // мс между запросами; один зашифрованный запрос за раз
 #define LINK_TIMEOUT   6000    // мс без ответов = считаем связь потерянной
-#define GAUGE_MAX      30      // максимум шкалы спидометра, км/ч (делится на 3)
+#define GAUGE_MAX      30      // шкала спидометра по умолчанию, км/ч (дальше меняется в настройках на экране)
 
 // Масштабы регистров. Если на странице отладки значения не сходятся - правь здесь.
 #define SPEED_SCALE    0.1f    // рег. 0x26 -> км/ч
@@ -24,19 +29,19 @@
 #define BMS_CUR_SCALE  0.01f   // А
 #define BMS_VOLT_SCALE 0.01f   // В
 
-// ---------- Палитра ----------
+// ---------- Палитра (меняется темой из настроек, см. applyTheme) ----------
 constexpr uint16_t C565(uint8_t r, uint8_t g, uint8_t b) {
   return ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
 }
-constexpr uint16_t COL_BG     = C565(8, 10, 18);
-constexpr uint16_t COL_PANEL  = C565(20, 26, 42);
-constexpr uint16_t COL_TRACK  = C565(36, 44, 64);
-constexpr uint16_t COL_ACCENT = C565(0, 200, 255);
-constexpr uint16_t COL_TXT    = C565(240, 244, 252);
-constexpr uint16_t COL_DIM    = C565(125, 138, 165);
-constexpr uint16_t COL_GOOD   = C565(60, 225, 120);
-constexpr uint16_t COL_WARN   = C565(255, 190, 40);
-constexpr uint16_t COL_BAD    = C565(255, 70, 70);
+uint16_t COL_BG     = C565(8, 10, 18);
+uint16_t COL_PANEL  = C565(20, 26, 42);
+uint16_t COL_TRACK  = C565(36, 44, 64);
+uint16_t COL_ACCENT = C565(0, 200, 255);
+uint16_t COL_TXT    = C565(240, 244, 252);
+uint16_t COL_DIM    = C565(125, 138, 165);
+uint16_t COL_GOOD   = C565(60, 225, 120);
+uint16_t COL_WARN   = C565(255, 190, 40);
+uint16_t COL_BAD    = C565(255, 70, 70);
 
 void status(const String& s, uint16_t col = COL_WARN);
 
@@ -506,6 +511,253 @@ void servicePendingTx() {
 }
 
 // =====================================================================
+//                 ПОЛЬЗОВАТЕЛЬСКИЕ НАСТРОЙКИ (хранятся в NVS)
+// =====================================================================
+#define SET_VER 1
+
+enum Metric : uint8_t { M_BATT, M_POWER, M_TRIP, M_TEMP, M_ODO, M_VOLT, M_CURR, M_MAXSPD, M_COUNT };
+static const char* const METRIC_NAME[M_COUNT] = {
+  "BATTERY", "POWER", "TRIP", "ESC / BAT", "ODOMETER", "VOLTAGE", "CURRENT", "TOP SPEED"
+};
+
+struct Cal { float x0, xk, y0, yk; uint8_t swap, flip, valid, pad; };
+struct Settings {
+  uint8_t ver, theme, accent, style, units, bright, dim, flip, lock, showInfo, showDebug, gmaxKmh, gmaxMph;
+  uint8_t card[4];
+  uint8_t lang;        // 0 - English, 1 - Русский
+  uint16_t hue;
+  Cal cal;
+};
+static Settings cfg;
+
+struct Theme { const char* name; const char* nameRu; uint16_t bg, panel, track, txt, dim, good, warn, bad; };
+static const Theme THEMES[4] = {
+  {"NAVY", "Синяя", C565(8, 10, 18), C565(20, 26, 42), C565(36, 44, 64),  C565(240, 244, 252), C565(125, 138, 165), C565(60, 225, 120), C565(255, 190, 40), C565(255, 70, 70)},
+  {"BLACK", "Чёрная", C565(0, 0, 0),   C565(18, 18, 22), C565(44, 44, 52),  C565(245, 245, 250), C565(130, 135, 150), C565(60, 225, 120), C565(255, 190, 40), C565(255, 70, 70)},
+  {"SLATE", "Серая", C565(30, 34, 40), C565(46, 52, 60), C565(74, 82, 94), C565(236, 240, 246), C565(150, 160, 176), C565(60, 225, 120), C565(255, 190, 40), C565(255, 80, 80)},
+  {"LIGHT", "Светлая", C565(232, 236, 244), C565(255, 255, 255), C565(205, 212, 226), C565(16, 20, 32), C565(92, 104, 126), C565(0, 150, 70), C565(225, 140, 0), C565(215, 40, 40)},
+};
+static const uint16_t ACCENTS[8] = {
+  C565(0, 200, 255), C565(70, 120, 255), C565(170, 90, 255), C565(255, 80, 170),
+  C565(255, 70, 70), C565(255, 140, 30), C565(255, 210, 40), C565(60, 225, 120)
+};
+static const char* const ACCENT_NAME[8] = {"cyan", "blue", "purple", "pink", "red", "orange", "yellow", "green"};
+static const char* const STYLE_NAME[3] = {"fade", "solid", "zones"};
+static const uint8_t DIM_SEC[4] = {0, 15, 30, 60};
+
+// ---------- Язык и кириллица ----------
+#define TR(en, ru) (cfg.lang ? (ru) : (en))
+static const char* const ACCENT_NAME_RU[8] = {"голубой", "синий", "сиреневый", "розовый", "красный", "оранжевый", "жёлтый", "зелёный"};
+static const char* const STYLE_NAME_RU[3] = {"плавная", "один цвет", "зоны"};
+static const char* const METRIC_NAME_RU[M_COUNT] = {"Батарея", "Мощность", "Поездка", "Темп. ESC/АКБ", "Одометр", "Напряжение", "Ток", "Макс. скорость"};
+static inline const char* metricName(int m) { m %= M_COUNT; return cfg.lang ? METRIC_NAME_RU[m] : METRIC_NAME[m]; }
+
+static bool nonAscii(const char* s) { while (*s) if ((uint8_t)*s++ >= 0x80) return true; return false; }
+static const GFXfont* ruFont(int font) { return font == 4 ? &RU4 : font == 2 ? &RU2 : &RU1; }
+
+// Рисует строку: текст с кириллицей - растровым шрифтом RU1/RU2/RU4 (по размеру встроенного шрифта 1/2/4),
+// всё остальное (цифры, латиница) - как раньше встроенными шрифтами TFT_eSPI.
+int drawS(const String& s, int x, int y, int font) {
+  if ((font == 1 || font == 2 || font == 4) && nonAscii(s.c_str())) {
+    tft.setFreeFont(ruFont(font));
+    int r = tft.drawString(s, x, y, 1);
+    tft.setFreeFont(nullptr);
+    return r;
+  }
+  return tft.drawString(s, x, y, font);
+}
+int textW(const String& s, int font) {
+  if ((font == 1 || font == 2 || font == 4) && nonAscii(s.c_str())) {
+    tft.setFreeFont(ruFont(font));
+    int w = tft.textWidth(s, 1);
+    tft.setFreeFont(nullptr);
+    return w;
+  }
+  return tft.textWidth(s, font);
+}
+
+// Статусные строки задаются в коде по-английски; перевод подставляется при отрисовке.
+String statusText(const char* s) {
+  if (!cfg.lang) return String(s);
+  static const char* const M[][2] = {
+    {"AUTH INIT", "Авторизация"}, {"PRESS POWER", "Нажмите кнопку"}, {"PAIRING", "Сопряжение"},
+    {"NO LINK", "Нет связи"}, {"scan...", "Поиск..."}, {"not found", "Не найден"},
+    {"conn fail", "Сбой подключения"}, {"no NUS", "Нет NUS"}, {"chr fail", "Ошибка BLE"},
+    {"link lost", "Связь потеряна"}, {"READY", "Готово"}};
+  for (auto& m : M) if (!strcmp(s, m[0])) return String(m[1]);
+  if (!strncmp(s, "LIVE ", 5)) return String("На связи ") + (s + 5);
+  if (!strncmp(s, "connect ", 8)) return String("Подключение ") + (s + 8);
+  return String(s);
+}
+
+uint16_t hue565(int h) {
+  h = ((h % 360) + 360) % 360;
+  int f = (h % 60) * 255 / 60, r, g, b;
+  switch (h / 60) {
+    case 0: r = 255; g = f; b = 0; break;
+    case 1: r = 255 - f; g = 255; b = 0; break;
+    case 2: r = 0; g = 255; b = f; break;
+    case 3: r = 0; g = 255 - f; b = 255; break;
+    case 4: r = f; g = 0; b = 255; break;
+    default: r = 255; g = 0; b = 255 - f; break;
+  }
+  return C565(r, g, b);
+}
+
+void applyTheme() {
+  const Theme& t = THEMES[cfg.theme < 4 ? cfg.theme : 0];
+  COL_BG = t.bg; COL_PANEL = t.panel; COL_TRACK = t.track; COL_TXT = t.txt; COL_DIM = t.dim;
+  COL_GOOD = t.good; COL_WARN = t.warn; COL_BAD = t.bad;
+  COL_ACCENT = cfg.accent < 8 ? ACCENTS[cfg.accent] : hue565(cfg.hue);
+}
+
+void setDefaults(bool keepCal) {
+  Cal c = cfg.cal;
+  memset(&cfg, 0, sizeof(cfg));
+  cfg.ver = SET_VER;
+  cfg.hue = 200;
+  cfg.bright = 100;
+  cfg.lock = 1;
+  cfg.showInfo = 1;
+  cfg.showDebug = 1;
+  cfg.gmaxKmh = GAUGE_MAX;
+  cfg.gmaxMph = 18;
+  cfg.card[0] = M_BATT; cfg.card[1] = M_POWER; cfg.card[2] = M_TRIP; cfg.card[3] = M_TEMP;
+  if (keepCal) cfg.cal = c;
+}
+
+static Preferences prefs;
+static bool saveDue = false;
+static uint32_t saveAt = 0;
+
+void loadSettings() {
+  setDefaults(false);
+  if (!prefs.begin("opendash", false)) return;
+  if (prefs.getBytesLength("cfg") == sizeof(Settings)) {
+    Settings t;
+    prefs.getBytes("cfg", &t, sizeof(t));
+    if (t.ver == SET_VER && t.theme < 4 && t.accent <= 8 && t.style < 3 && t.dim < 4 && t.lang < 2) cfg = t;
+  }
+  prefs.end();
+}
+void saveSettings() {
+  if (!prefs.begin("opendash", false)) return;
+  prefs.putBytes("cfg", &cfg, sizeof(cfg));
+  prefs.end();
+}
+void queueSave() { saveDue = true; saveAt = millis() + 1200; }
+
+// Единицы измерения (внутри всё хранится в км/ч и км)
+static inline float kmU(float km) { return cfg.units ? km * 0.621371f : km; }
+static inline const char* uSpd() { return cfg.units ? TR("mph", "миль/ч") : TR("km/h", "км/ч"); }
+static inline const char* uDst() { return cfg.units ? TR("mi", "миль") : TR("km", "км"); }
+static inline int gmax() { return cfg.units ? cfg.gmaxMph : cfg.gmaxKmh; }
+static inline bool pageOn(int p) { return p == 0 || (p == 1 && cfg.showInfo) || (p == 2 && cfg.showDebug); }
+void nextPage(int dir) {
+  int n = page;
+  for (int i = 0; i < 3; i++) { n = (n + dir + 3) % 3; if (pageOn(n)) { page = n; return; } }
+}
+
+// ---------- Экраны ----------
+enum Scr : uint8_t { S_MAIN, S_SET, S_APPEAR, S_DISPLAY, S_GAUGE, S_WIDGETS, S_PICK, S_CAL };
+static Scr scr = S_MAIN;
+static Scr pickReturn = S_WIDGETS;
+static uint8_t pickSlot = 0;
+static uint8_t calStep = 0;
+static bool calFromBoot = false, calFail = false;
+static float calRaw[3][2];
+static int uiMode = -1;
+static float sessionMax = 0;
+
+// ---------- Подсветка ----------
+#define BL_PIN 21
+#define BL_CH  0
+static bool dimmed = false;
+static uint32_t lastAct = 0;
+
+void setBacklight(int pct) { pct = constrain(pct, 5, 100); ledcWrite(BL_CH, (255 * pct) / 100); }
+void markActivity() { lastAct = millis(); if (dimmed) { dimmed = false; setBacklight(cfg.bright); } }
+
+// =====================================================================
+//                                 ТАЧ
+// =====================================================================
+#define TOUCH_CS   33
+#define TOUCH_IRQ  36
+#define TOUCH_CLK  25
+#define TOUCH_MISO 39
+#define TOUCH_MOSI 32
+#define CAL_M      20      // отступ калибровочных точек от краёв
+#define LONG_MS    650
+
+SPIClass touchSPI(VSPI);
+XPT2046_Touchscreen ts(TOUCH_CS, TOUCH_IRQ);
+
+struct TouchState {
+  bool down, moved, longDone, swallow, evDown, evTap, evLong, evUp;
+  int x, y, sx, sy;
+  int8_t swipe;            // +1 свайп влево (след. страница), -1 вправо
+  uint32_t t0, lastSeen;
+  long rAx, rAy;
+  int rN;
+} tch;
+
+static inline bool hit(int x, int y, int rx, int ry, int rw, int rh) {
+  return x >= rx && x < rx + rw && y >= ry && y < ry + rh;
+}
+
+void mapRaw(int rx, int ry, int& sx, int& sy) {
+  float a = cfg.cal.swap ? ry : rx;
+  float b = cfg.cal.swap ? rx : ry;
+  sx = constrain((int)(CAL_M + (a - cfg.cal.x0) * cfg.cal.xk), 0, 239);
+  sy = constrain((int)(CAL_M + (b - cfg.cal.y0) * cfg.cal.yk), 0, 319);
+  if (cfg.cal.flip != cfg.flip) { sx = 239 - sx; sy = 319 - sy; }
+}
+
+void touchUpdate() {
+  tch.evDown = tch.evTap = tch.evLong = tch.evUp = false;
+  tch.swipe = 0;
+  uint32_t now = millis();
+  bool pressed = false;
+  int rx = 0, ry = 0;
+  if (ts.touched()) {
+    TS_Point p = ts.getPoint();
+    if (p.z > 350) { pressed = true; rx = p.x; ry = p.y; }
+  }
+  if (pressed) {
+    tch.lastSeen = now;
+    int sx, sy;
+    mapRaw(rx, ry, sx, sy);
+    if (!tch.down) {
+      tch.down = true; tch.moved = false; tch.longDone = false;
+      tch.x = tch.sx = sx; tch.y = tch.sy = sy; tch.t0 = now;
+      tch.rAx = tch.rAy = 0; tch.rN = 0;
+      tch.swallow = dimmed;            // первое касание только будит экран
+      markActivity();
+      tch.evDown = !tch.swallow;
+    } else {
+      tch.x = (tch.x + sx) / 2;
+      tch.y = (tch.y + sy) / 2;
+    }
+    if (tch.rN < 200) { tch.rAx += rx; tch.rAy += ry; tch.rN++; }
+    if (!tch.moved && (abs(tch.x - tch.sx) > 14 || abs(tch.y - tch.sy) > 14)) tch.moved = true;
+    if (!tch.swallow && !tch.moved && !tch.longDone && now - tch.t0 > LONG_MS) {
+      tch.longDone = true;
+      tch.evLong = true;
+    }
+  } else if (tch.down && now - tch.lastSeen > 45) {
+    tch.down = false;
+    if (!tch.swallow) {
+      tch.evUp = true;
+      if (!tch.moved && !tch.longDone) tch.evTap = true;
+      else if (tch.moved) {
+        int dx = tch.x - tch.sx, dy = tch.y - tch.sy;
+        if (abs(dx) >= 40 && abs(dx) > abs(dy) * 3 / 2) tch.swipe = dx < 0 ? 1 : -1;
+      }
+    }
+  }
+}
+
+// =====================================================================
 //                               ИНТЕРФЕЙС
 // =====================================================================
 
@@ -522,13 +774,21 @@ void status(const String& s, uint16_t col) {
   stDirty = true;
 }
 
+String fitText(const String& s, int maxW, int font) {
+  if (textW(s, font) <= maxW) return s;
+  String t = s;
+  while (t.length() > 1 && textW(t + "..", font) > maxW) t.remove(t.length() - 1);
+  return t + "..";
+}
+
 void drawStatus() {
+  if (scr != S_MAIN) return;       // в настройках шапку не трогаем
   stDirty = false;
-  tft.fillCircle(229, 11, 3, stCol);
-  tft.setTextDatum(TR_DATUM);
+  tft.fillCircle(10, 11, 3, stCol);
+  tft.setTextDatum(TL_DATUM);
   tft.setTextColor(stCol, COL_PANEL);
-  tft.setTextPadding(112);
-  tft.drawString(stText, 220, 3, 2);
+  tft.setTextPadding(140);
+  drawS(fitText(statusText(stText), 138, 2), 18, 3, 2);
 }
 
 void statusNow(const String& s, uint16_t col = COL_WARN) {
@@ -540,16 +800,15 @@ void statusNow(const String& s, uint16_t col = COL_WARN) {
 #define SLOTS 48
 static String cacheS[SLOTS];
 static uint16_t cacheC[SLOTS];
-static int uiMode = -1;
 static int chipKey = -1;
 static int litShown = 0;
-static uint32_t barKey = 0xFFFFFFFF;
+static uint32_t barKeys[4];
 
 void clearCache() {
   for (int i = 0; i < SLOTS; i++) { cacheS[i] = "\x01"; cacheC[i] = 0; }
   chipKey = -1;
   litShown = 0;
-  barKey = 0xFFFFFFFF;
+  for (int i = 0; i < 4; i++) barKeys[i] = 0xFFFFFFFF;
 }
 
 void field(uint8_t slot, int x, int y, const String& s, int w, int font,
@@ -560,7 +819,7 @@ void field(uint8_t slot, int x, int y, const String& s, int w, int font,
   tft.setTextDatum(datum);
   tft.setTextColor(fg, bg);
   tft.setTextPadding(w);
-  tft.drawString(s, x, y, font);
+  drawS(s, x, y, font);
 }
 
 uint16_t lerp565(uint16_t a, uint16_t b, uint8_t t) {
@@ -578,24 +837,35 @@ void label(int x, int y, const char* s, uint8_t datum = TL_DATUM) {
   tft.setTextDatum(datum);
   tft.setTextColor(COL_DIM, COL_PANEL);
   tft.setTextPadding(0);
-  tft.drawString(s, x, y, 1);
+  drawS(s, x, y, 1);
 }
 
 uint16_t tempColor(float t) { return t < 45 ? COL_GOOD : t < 60 ? COL_WARN : COL_BAD; }
 
 // ---------- Шапка ----------
+void drawGear(int cx, int cy, uint16_t col, uint16_t bg) {
+  tft.fillRect(cx - 2, cy - 9, 4, 4, col);
+  tft.fillRect(cx - 2, cy + 5, 4, 4, col);
+  tft.fillRect(cx - 9, cy - 2, 4, 4, col);
+  tft.fillRect(cx + 5, cy - 2, 4, 4, col);
+  tft.fillCircle(cx, cy, 6, col);
+  tft.fillCircle(cx, cy, 2, bg);
+}
+
 void drawHeaderStatic(bool dots) {
   tft.fillRect(0, 0, 240, 23, COL_PANEL);
   tft.drawFastHLine(0, 23, 240, COL_TRACK);
-  tft.setTextPadding(0);
-  tft.setTextDatum(TL_DATUM);
-  tft.setTextColor(COL_ACCENT, COL_PANEL);
-  tft.drawString("OPEN", 10, 3, 2);
-  tft.setTextColor(COL_TXT, COL_PANEL);
-  tft.drawString("DASH", 10 + tft.textWidth("OPEN", 2) + 4, 3, 2);
   if (dots) {
-    for (int i = 0; i < 3; i++) tft.fillCircle(104 + i * 11, 11, i == page ? 3 : 2, i == page ? COL_ACCENT : COL_TRACK);
+    int n = 0;
+    for (int p = 0; p < 3; p++) if (pageOn(p)) n++;
+    int x = 196 - (n - 1) * 12;
+    for (int p = 0; p < 3; p++) {
+      if (!pageOn(p)) continue;
+      tft.fillCircle(x, 11, p == page ? 3 : 2, p == page ? COL_ACCENT : COL_TRACK);
+      x += 12;
+    }
   }
+  drawGear(224, 11, COL_DIM, COL_PANEL);
 }
 
 // ---------- Спидометр ----------
@@ -603,9 +873,11 @@ void drawHeaderStatic(bool dots) {
 const int GCX = 120, GCY = 118, GR_O = 82, GR_I = 69;
 
 uint16_t gaugeColor(int i) {
-  static const uint16_t stops[4] = {C565(0, 200, 255), C565(60, 230, 120), C565(255, 200, 40), C565(255, 60, 60)};
-  static const float pos[4] = {0.0f, 0.5f, 0.75f, 1.0f};
   float t = (float)i / (GAUGE_SEGS - 1);
+  if (cfg.style == 1) return COL_ACCENT;
+  if (cfg.style == 2) return t < 0.5f ? COL_GOOD : t < 0.75f ? COL_WARN : COL_BAD;
+  const uint16_t stops[4] = {COL_ACCENT, COL_GOOD, COL_WARN, COL_BAD};
+  static const float pos[4] = {0.0f, 0.5f, 0.75f, 1.0f};
   for (int k = 0; k < 3; k++)
     if (t <= pos[k + 1]) return lerp565(stops[k], stops[k + 1], (uint8_t)((t - pos[k]) / (pos[k + 1] - pos[k]) * 255));
   return stops[3];
@@ -624,7 +896,7 @@ void gaugeSeg(int i, uint16_t col) {
 }
 
 void updateGauge(float speed) {
-  int lit = constrain((int)lroundf(speed / GAUGE_MAX * GAUGE_SEGS), 0, GAUGE_SEGS);
+  int lit = constrain((int)lroundf(speed / gmax() * GAUGE_SEGS), 0, GAUGE_SEGS);
   if (lit == litShown) return;
   if (lit > litShown) { for (int i = litShown; i < lit; i++) gaugeSeg(i, gaugeColor(i)); }
   else                { for (int i = lit; i < litShown; i++) gaugeSeg(i, COL_TRACK); }
@@ -632,6 +904,9 @@ void updateGauge(float speed) {
 }
 
 // ---------- Страница 0: панель ----------
+static const int CX[4] = {8, 124, 8, 124};
+static const int CY[4] = {207, 207, 263, 263};
+
 void dashStatic() {
   for (int i = 0; i < GAUGE_SEGS; i++) gaugeSeg(i, COL_TRACK);
   litShown = 0;
@@ -642,66 +917,107 @@ void dashStatic() {
   for (int k = 0; k <= 3; k++) {
     float a = (-120.0f + 80.0f * k) * 0.0174533f;
     char b[6];
-    snprintf(b, sizeof(b), "%d", GAUGE_MAX * k / 3);
-    tft.drawString(b, lroundf(GCX + 57 * sinf(a)), lroundf(GCY - 57 * cosf(a)), 1);
+    snprintf(b, sizeof(b), "%d", gmax() * k / 3);
+    drawS(b, lroundf(GCX + 57 * sinf(a)), lroundf(GCY - 57 * cosf(a)), 1);
   }
   tft.setTextColor(COL_ACCENT, COL_BG);
-  tft.drawString("km/h", GCX, GCY + 20, 2);
-  card(8, 207, 108, 50);
-  card(124, 207, 108, 50);
-  card(8, 263, 108, 50);
-  card(124, 263, 108, 50);
-  label(16, 211, "BATTERY");
-  label(132, 211, "POWER");
-  label(16, 267, "TRIP");
-  label(132, 267, "ESC / BAT C");
+  drawS(uSpd(), GCX, GCY + 20, 2);
+  for (int i = 0; i < 4; i++) {
+    card(CX[i], CY[i], 108, 50);
+    label(CX[i] + 8, CY[i] + 4, metricName(cfg.card[i]));
+  }
 }
 
-void drawBar(int lit, uint16_t col) {
+void drawBar(int x, int y, int lit, uint16_t col) {
   for (int i = 0; i < 10; i++)
-    tft.fillRoundRect(16 + (i * 92) / 10, 243, 7, 6, 2, i < lit ? col : COL_TRACK);
+    tft.fillRoundRect(x + (i * 92) / 10, y, 7, 6, 2, i < lit ? col : COL_TRACK);
+}
+
+struct CardOut { String v, sub; uint16_t col; int bar; };
+
+CardOut metricOut(uint8_t m) {
+  CardOut o;
+  o.v = "--"; o.sub = " "; o.col = COL_DIM; o.bar = -1;
+  const bool hasTotal = (d.valid & ((1U << TOTAL_LO) | (1U << TOTAL_HI))) == ((1U << TOTAL_LO) | (1U << TOTAL_HI));
+  switch (m) {
+    case M_BATT:
+      o.bar = 0;
+      if (d.valid & (1U << SOC)) {
+        o.v = String(d.soc) + "%";
+        o.col = d.soc > 50 ? COL_GOOD : d.soc > 20 ? COL_WARN : COL_BAD;
+        o.bar = (d.soc + 5) / 10;
+      }
+      break;
+    case M_POWER:
+      if ((d.valid & (1U << VOLT)) && (d.valid & (1U << AMP))) {
+        float w = d.volt * d.amp;
+        o.v = String((int)w) + " W";
+        o.col = w < -5 ? COL_GOOD : w > 600 ? COL_WARN : COL_TXT;
+        o.sub = String(d.volt, 1) + "V " + String(d.amp, 1) + "A";
+      } else o.v = "-- W";
+      break;
+    case M_TRIP:
+      if (d.valid & (1U << TRIP)) { o.v = String(kmU(d.tripKm), 2); o.col = COL_TXT; }
+      o.sub = uDst();
+      break;
+    case M_TEMP: {
+      bool he = d.valid & (1U << ETEMP), hb = d.valid & (1U << BTEMP);
+      o.v = (he ? String((int)lroundf(d.escTemp)) : String("--")) + "/" + (hb ? String((int)lroundf(d.battTemp)) : String("--"));
+      o.col = he ? tempColor(d.escTemp) : hb ? tempColor(d.battTemp) : COL_DIM;
+      o.sub = TR("ESC/BAT C", "ESC/АКБ C");
+      break;
+    }
+    case M_ODO:
+      if (hasTotal) {
+        float t = kmU(d.totalKm);
+        o.v = t >= 1000 ? String((int)lroundf(t)) : String(t, 1);
+        o.col = COL_TXT;
+      }
+      o.sub = uDst();
+      break;
+    case M_VOLT:
+      if (d.valid & (1U << VOLT)) { o.v = String(d.volt, 1) + " V"; o.col = COL_TXT; }
+      break;
+    case M_CURR:
+      if (d.valid & (1U << AMP)) { o.v = String(d.amp, 1) + " A"; o.col = d.amp < -0.5f ? COL_GOOD : COL_TXT; }
+      break;
+    case M_MAXSPD:
+      if (d.valid & (1U << SPEED)) { o.v = String(kmU(sessionMax), 1); o.col = COL_TXT; }
+      o.sub = String(uSpd()) + " " + TR("this ride", "за поездку");
+      break;
+  }
+  return o;
 }
 
 void dashDynamic() {
   const bool hasSpeed = d.valid & (1U << SPEED);
-  const bool hasSoc = d.valid & (1U << SOC);
-  const bool hasV = d.valid & (1U << VOLT);
-  const bool hasA = d.valid & (1U << AMP);
   const bool hasTotal = (d.valid & ((1U << TOTAL_LO) | (1U << TOTAL_HI))) == ((1U << TOTAL_LO) | (1U << TOTAL_HI));
 
-  updateGauge(hasSpeed ? d.speed : 0);
-  field(0, GCX, GCY - 8, hasSpeed ? String(d.speed, 1) : String("--"), 120, 7, COL_TXT, MC_DATUM, COL_BG);
-  field(1, GCX, 188, hasTotal ? "ODO " + String(d.totalKm, 1) + " km" : String("ODO -- km"), 150, 2, COL_DIM, MC_DATUM, COL_BG);
+  updateGauge(hasSpeed ? kmU(d.speed) : 0);
+  field(0, GCX, GCY - 8, hasSpeed ? String(kmU(d.speed), 1) : String("--"), 120, 7, COL_TXT, MC_DATUM, COL_BG);
+  field(1, GCX, 188, hasTotal ? TR("ODO ", "ОДО ") + String(kmU(d.totalKm), 1) + " " + uDst() : String(TR("ODO -- ", "ОДО -- ")) + uDst(), 150, 2, COL_DIM, MC_DATUM, COL_BG);
 
-  // Батарея
-  uint16_t bc = !hasSoc ? COL_DIM : d.soc > 50 ? COL_GOOD : d.soc > 20 ? COL_WARN : COL_BAD;
-  field(2, 16, 225, hasSoc ? String(d.soc) + "%" : String("--"), 90, 4, bc, TL_DATUM, COL_PANEL);
-  int lit = hasSoc ? (d.soc + 5) / 10 : 0;
-  uint32_t key = ((uint32_t)lit << 16) | bc;
-  if (key != barKey) { barKey = key; drawBar(lit, bc); }
-
-  // Мощность
-  float w = d.volt * d.amp;
-  uint16_t pc = w < -5 ? COL_GOOD : w > 600 ? COL_WARN : COL_TXT;
-  field(3, 132, 225, hasV && hasA ? String((int)w) + " W" : String("-- W"), 96, 4, pc, TL_DATUM, COL_PANEL);
-  field(4, 132, 246, hasV && hasA ? String(d.volt, 1) + "V " + String(d.amp, 1) + "A" : String("--"), 96, 1, COL_DIM, TL_DATUM, COL_PANEL);
-
-  // Поездка
-  field(5, 16, 281, d.valid & (1U << TRIP) ? String(d.tripKm, 2) : String("--"), 90, 4, COL_TXT, TL_DATUM, COL_PANEL);
-
-  // Температуры
-  bool he = d.valid & (1U << ETEMP), hb = d.valid & (1U << BTEMP);
-  field(6, 132, 281, he && hb ? String((int)lroundf(d.escTemp)) + " / " + String((int)lroundf(d.battTemp)) :
-        he ? String((int)lroundf(d.escTemp)) + " / --" :
-        hb ? String("-- / ") + String((int)lroundf(d.battTemp)) : String("-- / --"),
-        96, 2, he ? tempColor(d.escTemp) : hb ? tempColor(d.battTemp) : COL_DIM, TL_DATUM, COL_PANEL);
+  for (int i = 0; i < 4; i++) {
+    CardOut c = metricOut(cfg.card[i] % M_COUNT);
+    field(2 + 2 * i, CX[i] + 8, CY[i] + 18, c.v, 92, 4, c.col, TL_DATUM, COL_PANEL);
+    if (c.bar >= 0) {
+      uint32_t key = ((uint32_t)c.bar << 16) | c.col;
+      if (key != barKeys[i]) { barKeys[i] = key; drawBar(CX[i] + 8, CY[i] + 36, c.bar, c.col); }
+    } else {
+      field(3 + 2 * i, CX[i] + 8, CY[i] + 39, c.sub, 92, 1, COL_DIM, TL_DATUM, COL_PANEL);
+    }
+  }
 }
 
 // ---------- Страница 1: информация ----------
 static void tileXY(int i, int& x, int& y) { x = 6; y = 28 + i * 36; }
 
 void infoStatic() {
-  const char* L[8] = {"DEVICE", "SERIAL", "FIRMWARE", "ODOMETER (km)", "TRIP (km)", "VOLTAGE (V)", "CURRENT (A)", "ESC / BAT TEMP"};
+  char odoL[28], tripL[28];
+  snprintf(odoL, sizeof(odoL), TR("ODOMETER (%s)", "Одометр (%s)"), uDst());
+  snprintf(tripL, sizeof(tripL), TR("TRIP (%s)", "Поездка (%s)"), uDst());
+  const char* L[8] = {TR("DEVICE", "Устройство"), TR("SERIAL", "Серийный номер"), TR("FIRMWARE", "Прошивка"), odoL, tripL,
+                      TR("VOLTAGE (V)", "Напряжение (В)"), TR("CURRENT (A)", "Ток (А)"), TR("ESC / BAT TEMP", "Темп. ESC / АКБ")};
   for (int i = 0; i < 8; i++) {
     int x, y;
     tileXY(i, x, y);
@@ -718,8 +1034,8 @@ void infoDynamic() {
     devName,
     d.serial[0] ? String(d.serial) : String("--"),
     d.fw ? String(b) : String("--"),
-    hasTotal ? String(d.totalKm, 1) : String("--"),
-    d.valid & (1U << TRIP) ? String(d.tripKm, 2) : String("--"),
+    hasTotal ? String(kmU(d.totalKm), 1) : String("--"),
+    d.valid & (1U << TRIP) ? String(kmU(d.tripKm), 2) : String("--"),
     d.valid & (1U << VOLT) ? String(d.volt, 2) : String("--"),
     d.valid & (1U << AMP) ? String(d.amp, 2) : String("--"),
     String(d.valid & (1U << ETEMP) ? String((int)lroundf(d.escTemp)) : String("--")) + " / " +
@@ -768,6 +1084,20 @@ void debugDynamic() {
 }
 
 // ---------- Экран подключения ----------
+void connectStatic() {
+  tft.setTextPadding(0);
+  tft.setTextDatum(TL_DATUM);
+  int w1 = tft.textWidth("OPEN", 2), w2 = tft.textWidth("DASH", 2);
+  int x = 120 - (w1 + 4 + w2) / 2;
+  tft.setTextColor(COL_ACCENT, COL_BG);
+  drawS("OPEN", x, 31, 2);
+  tft.setTextColor(COL_TXT, COL_BG);
+  drawS("DASH", x + w1 + 4, 31, 2);
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(COL_DIM, COL_BG);
+  drawS(TR("Tap the gear for settings", "Настройки: значок шестерёнки"), 120, 292, 1);
+}
+
 void connectDynamic() {
   int phase;
   if (!connected) phase = 0;
@@ -786,53 +1116,531 @@ void connectDynamic() {
     int dd = (head - i + 12) % 12;
     uint8_t alpha = dd < 7 ? 255 - dd * 36 : 20;
     float a = i * 30 * 0.0174533f;
-    tft.fillCircle(120 + lroundf(34 * sinf(a)), 92 - lroundf(34 * cosf(a)), 5, lerp565(COL_BG, base, alpha));
+    tft.fillCircle(120 + lroundf(34 * sinf(a)), 100 - lroundf(34 * cosf(a)), 5, lerp565(COL_BG, base, alpha));
   }
 
-  static const char* titles[4] = {"SEARCHING", "CONNECTING", "PRESS POWER", "PAIRING"};
-  static const char* subs[4] = {"Turn on the scooter and stay close", "Starting secure handshake",
-                                "Press the scooter power button once", "Almost there..."};
-  field(40, 120, 148, titles[phase], 224, 4, power ? COL_WARN : COL_TXT, MC_DATUM, COL_BG);
-  field(41, 120, 180, subs[phase], 224, 2, COL_DIM, MC_DATUM, COL_BG);
+  const char* titles[4] = {TR("SEARCHING", "Поиск"), TR("CONNECTING", "Подключение"), TR("PRESS POWER", "Нажмите кнопку"), TR("PAIRING", "Сопряжение")};
+  const char* subs[4] = {TR("Turn on the scooter and stay close", "Включите самокат и будьте рядом"),
+                         TR("Starting secure handshake", "Устанавливаем защищённую связь"),
+                         TR("Press the scooter power button once", "Нажмите кнопку питания самоката"),
+                         TR("Almost there...", "Почти готово...")};
+  field(40, 120, 156, titles[phase], 224, 4, power ? COL_WARN : COL_TXT, MC_DATUM, COL_BG);
+  field(41, 120, 186, subs[phase], 224, 2, COL_DIM, MC_DATUM, COL_BG);
 
   int key = phase * 2 + (blink ? 1 : 0);
   if (key != chipKey) {
     chipKey = key;
-    static const char* names[4] = {"SCAN", "LINK", "POWER", "PAIR"};
+    const char* names[4] = {TR("SCAN", "Поиск"), TR("LINK", "Связь"), TR("POWER", "Кнопка"), TR("PAIR", "Пара")};
     for (int i = 0; i < 4; i++) {
       int x = 8 + i * 57;
       uint16_t fill, fg;
-      if (i < phase)       { fill = C565(0, 70, 96); fg = COL_TXT; }
+      if (i < phase)       { fill = lerp565(COL_PANEL, COL_ACCENT, 90); fg = COL_TXT; }
       else if (i == phase) { fill = blink ? COL_TXT : base; fg = COL_BG; }
       else                 { fill = COL_PANEL; fg = COL_DIM; }
-      tft.fillRoundRect(x, 220, 52, 26, 6, fill);
+      tft.fillRoundRect(x, 224, 52, 26, 6, fill);
       tft.setTextDatum(MC_DATUM);
       tft.setTextColor(fg, fill);
       tft.setTextPadding(0);
-      tft.drawString(names[i], x + 26, 227, 1);
+      drawS(names[i], x + 26, 231, 1);
     }
+  }
+}
+
+// =====================================================================
+//                         ЭКРАНЫ НАСТРОЕК
+// =====================================================================
+void btn(int x, int y, int w, int h, const char* txt, bool sel, int font = 2) {
+  uint16_t fill = sel ? COL_ACCENT : COL_PANEL;
+  uint16_t fg = sel ? COL_BG : COL_TXT;
+  tft.fillRoundRect(x, y, w, h, 6, fill);
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(fg, fill);
+  tft.setTextPadding(0);
+  drawS(txt, x + w / 2, y + h / 2, font);
+}
+
+void secLabel(int x, int y, const char* s) {
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextColor(COL_DIM, COL_BG);
+  tft.setTextPadding(0);
+  drawS(s, x, y, 1);
+}
+
+void settingsHeader(const char* title) {
+  tft.fillRect(0, 0, 240, 28, COL_PANEL);
+  tft.drawFastHLine(0, 28, 240, COL_TRACK);
+  tft.fillTriangle(16, 14, 25, 7, 25, 21, COL_ACCENT);
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(COL_TXT, COL_PANEL);
+  tft.setTextPadding(0);
+  drawS(title, 130, 14, 2);
+}
+
+void drawSlider(int y, float frac) {
+  frac = constrain(frac, 0.0f, 1.0f);
+  tft.fillRoundRect(10, y, 220, 28, 8, COL_PANEL);
+  tft.fillRoundRect(10, y, 12 + (int)(frac * 208), 28, 8, COL_ACCENT);
+}
+
+void drawBrightness() {
+  char b[8];
+  snprintf(b, sizeof(b), "%d%%", cfg.bright);
+  tft.setTextDatum(TR_DATUM);
+  tft.setTextColor(COL_ACCENT, COL_BG);
+  tft.setTextPadding(48);
+  drawS(b, 232, 34, 2);
+  drawSlider(52, (cfg.bright - 10) / 90.0f);
+}
+
+void drawHueSlider() {
+  tft.fillRect(8, 200, 224, 6, COL_BG);
+  tft.fillRect(8, 236, 224, 6, COL_BG);
+  for (int i = 0; i < 220; i++) tft.drawFastVLine(10 + i, 206, 30, hue565(i * 359 / 219));
+  int kx = 10 + cfg.hue * 219 / 359;
+  tft.fillRoundRect(kx - 4, 201, 9, 40, 3, COL_TXT);
+  tft.fillRect(kx - 2, 206, 5, 30, hue565(cfg.hue));
+}
+
+void drawGaugePreview() {
+  for (int i = 0; i < GAUGE_SEGS; i++) tft.fillRect(20 + i * 5, 250, 4, 18, gaugeColor(i));
+}
+
+void drawSettingsScreen() {
+  char b[56];
+  switch (scr) {
+    case S_SET: {
+      settingsHeader(TR("SETTINGS", "Настройки"));
+      const char* titles[7] = {TR("APPEARANCE", "Внешний вид"), TR("DISPLAY", "Экран"), TR("GAUGE & UNITS", "Шкала и единицы"),
+                               TR("WIDGETS & PAGES", "Виджеты и страницы"), TR("LANGUAGE", "Язык"),
+                               TR("TOUCH CALIBRATION", "Калибровка тача"), TR("RESET TO DEFAULTS", "Сброс настроек")};
+      char dm[10];
+      if (cfg.dim) snprintf(dm, sizeof(dm), TR("%ds", "%d с"), DIM_SEC[cfg.dim]); else strcpy(dm, TR("off", "выкл"));
+      const char* tn = cfg.lang ? THEMES[cfg.theme].nameRu : THEMES[cfg.theme].name;
+      const char* an = cfg.accent < 8 ? (cfg.lang ? ACCENT_NAME_RU[cfg.accent] : ACCENT_NAME[cfg.accent]) : TR("custom", "свой");
+      const char* sn = cfg.lang ? STYLE_NAME_RU[cfg.style] : STYLE_NAME[cfg.style];
+      char sub[7][56];
+      snprintf(sub[0], 56, TR("%s theme, %s accent", "%s, акцент: %s"), tn, an);
+      snprintf(sub[1], 56, TR("brightness %d%%, auto-dim %s", "яркость %d%%, затемнение: %s"), cfg.bright, dm);
+      snprintf(sub[2], 56, TR("%s, max %d, %s gauge", "%s, макс. %d, шкала: %s"), uSpd(), gmax(), sn);
+      snprintf(sub[3], 56, TR("4 cards, info %s, debug %s", "инфо: %s, отладка: %s"),
+               cfg.showInfo ? TR("on", "вкл") : TR("off", "выкл"), cfg.showDebug ? TR("on", "вкл") : TR("off", "выкл"));
+      snprintf(sub[4], 56, "%s", cfg.lang ? "Русский (нажмите: English)" : "English (tap: Русский)");
+      snprintf(sub[5], 56, "%s", TR("re-map the touch panel (3 taps)", "откалибровать сенсор (3 касания)"));
+      snprintf(sub[6], 56, "%s", TR("press and HOLD to restore defaults", "удерживайте для сброса"));
+      for (int i = 0; i < 7; i++) {
+        int y = 34 + i * 41;
+        tft.fillRoundRect(8, y, 224, 36, 6, COL_PANEL);
+        tft.fillRect(8, y + 7, 3, 22, i == 6 ? COL_BAD : COL_ACCENT);
+        tft.setTextDatum(TL_DATUM);
+        tft.setTextPadding(0);
+        tft.setTextColor(i == 6 ? COL_BAD : COL_TXT, COL_PANEL);
+        drawS(titles[i], 20, y + 3, 2);
+        tft.setTextColor(COL_DIM, COL_PANEL);
+        drawS(sub[i], 20, y + 22, 1);
+        if (i != 4) {
+          tft.drawLine(216, y + 12, 222, y + 18, COL_DIM);
+          tft.drawLine(222, y + 18, 216, y + 24, COL_DIM);
+        }
+      }
+      break;
+    }
+    case S_APPEAR: {
+      settingsHeader(TR("APPEARANCE", "Внешний вид"));
+      secLabel(8, 36, TR("THEME", "Тема"));
+      for (int i = 0; i < 4; i++) {
+        int x = 8 + i * 58, y = 48;
+        const Theme& t = THEMES[i];
+        tft.fillRoundRect(x, y, 54, 40, 6, t.bg);
+        tft.drawRoundRect(x, y, 54, 40, 6, cfg.theme == i ? COL_ACCENT : COL_TRACK);
+        if (cfg.theme == i) tft.drawRoundRect(x + 1, y + 1, 52, 38, 5, COL_ACCENT);
+        tft.fillRoundRect(x + 6, y + 6, 42, 12, 3, t.panel);
+        tft.setTextDatum(MC_DATUM);
+        tft.setTextColor(t.txt, t.bg);
+        tft.setTextPadding(0);
+        drawS(cfg.lang ? t.nameRu : t.name, x + 27, y + 29, 1);
+      }
+      secLabel(8, 98, TR("ACCENT COLOR", "Цвет акцента"));
+      for (int i = 0; i < 8; i++) {
+        int x = 8 + (i % 4) * 58, y = 110 + (i / 4) * 38;
+        tft.fillRoundRect(x, y, 54, 34, 6, ACCENTS[i]);
+        if (cfg.accent == i) {
+          tft.drawRoundRect(x, y, 54, 34, 6, COL_TXT);
+          tft.drawRoundRect(x + 1, y + 1, 52, 32, 5, COL_TXT);
+          tft.fillCircle(x + 27, y + 17, 4, COL_BG);
+        }
+      }
+      secLabel(8, 190, TR("CUSTOM HUE (drag)", "Свой оттенок (проведите пальцем)"));
+      drawHueSlider();
+      secLabel(8, 254, TR("Pick a preset or drag the hue strip.", "Выберите цвет или двигайте полосу."));
+      break;
+    }
+    case S_DISPLAY: {
+      settingsHeader(TR("DISPLAY", "Экран"));
+      secLabel(8, 38, TR("BRIGHTNESS", "Яркость"));
+      drawBrightness();
+      secLabel(8, 98, TR("AUTO-DIM WHEN IDLE", "Затемнение при бездействии"));
+      const char* dl[4] = {TR("OFF", "Выкл"), TR("15 s", "15 с"), TR("30 s", "30 с"), TR("60 s", "60 с")};
+      for (int i = 0; i < 4; i++) btn(8 + i * 58, 110, 54, 40, dl[i], cfg.dim == i);
+      secLabel(8, 160, TR("ORIENTATION", "Ориентация"));
+      btn(8, 172, 108, 40, TR("NORMAL", "Обычная"), cfg.flip == 0);
+      btn(124, 172, 108, 40, TR("FLIPPED 180", "Перевёрнута"), cfg.flip == 1);
+      secLabel(8, 222, TR("RIDE LOCK (ignore taps above 3 km/h)", "Блок. в движении (быстрее 3 км/ч)"));
+      btn(8, 234, 108, 40, TR("ON", "Вкл"), cfg.lock == 1);
+      btn(124, 234, 108, 40, TR("OFF", "Выкл"), cfg.lock == 0);
+      secLabel(8, 284, TR("Swipes between pages always work.", "Свайпы страниц работают всегда."));
+      break;
+    }
+    case S_GAUGE: {
+      settingsHeader(TR("GAUGE & UNITS", "Шкала и единицы"));
+      secLabel(8, 36, TR("SPEED UNIT", "Единицы скорости"));
+      btn(8, 48, 108, 44, TR("KM/H", "км/ч"), cfg.units == 0);
+      btn(124, 48, 108, 44, TR("MPH", "миль/ч"), cfg.units == 1);
+      secLabel(8, 104, TR("GAUGE MAX (step 3)", "Максимум шкалы (шаг 3)"));
+      btn(8, 116, 64, 44, "-", false, 4);
+      btn(168, 116, 64, 44, "+", false, 4);
+      tft.setTextDatum(MC_DATUM);
+      tft.setTextPadding(0);
+      tft.setTextColor(COL_TXT, COL_BG);
+      snprintf(b, sizeof(b), "%d", gmax());
+      drawS(b, 120, 131, 4);
+      tft.setTextColor(COL_DIM, COL_BG);
+      drawS(uSpd(), 120, 150, 1);
+      secLabel(8, 172, TR("GAUGE COLORS", "Цвета шкалы"));
+      btn(8, 184, 72, 44, TR("FADE", "Плавно"), cfg.style == 0);
+      btn(84, 184, 72, 44, TR("SOLID", "Один"), cfg.style == 1);
+      btn(160, 184, 72, 44, TR("ZONES", "Зоны"), cfg.style == 2);
+      secLabel(8, 238, TR("PREVIEW", "Предпросмотр"));
+      drawGaugePreview();
+      break;
+    }
+    case S_WIDGETS: {
+      settingsHeader(TR("WIDGETS & PAGES", "Виджеты и страницы"));
+      secLabel(8, 36, TR("TAP A CARD TO CHOOSE ITS DATA", "Нажмите карточку, чтобы выбрать данные"));
+      for (int i = 0; i < 4; i++) {
+        int x = 8 + (i % 2) * 116, y = 48 + (i / 2) * 70;
+        tft.fillRoundRect(x, y, 108, 64, 6, COL_PANEL);
+        tft.fillRect(x, y + 12, 3, 40, COL_ACCENT);
+        snprintf(b, sizeof(b), TR("CARD %d", "Карточка %d"), i + 1);
+        tft.setTextDatum(TL_DATUM);
+        tft.setTextPadding(0);
+        tft.setTextColor(COL_DIM, COL_PANEL);
+        drawS(b, x + 10, y + 8, 1);
+        tft.setTextDatum(MC_DATUM);
+        tft.setTextColor(COL_TXT, COL_PANEL);
+        drawS(metricName(cfg.card[i]), x + 54, y + 38, 2);
+      }
+      secLabel(8, 194, TR("PAGES", "Страницы"));
+      snprintf(b, sizeof(b), TR("INFO: %s", "Инфо: %s"), cfg.showInfo ? TR("ON", "вкл") : TR("OFF", "выкл"));
+      btn(8, 206, 108, 44, b, cfg.showInfo);
+      snprintf(b, sizeof(b), TR("DEBUG: %s", "Отладка: %s"), cfg.showDebug ? TR("ON", "вкл") : TR("OFF", "выкл"));
+      btn(124, 206, 108, 44, b, cfg.showDebug);
+      secLabel(8, 262, TR("On the dashboard: tap a card = next data,", "Нажатие на карточку: следующие данные,"));
+      secLabel(8, 274, TR("hold a card = pick from list,", "удержание: выбор из списка,"));
+      secLabel(8, 286, TR("tap the gauge = switch km/h / mph.", "нажатие на шкалу: км/ч / миль/ч."));
+      break;
+    }
+    case S_PICK: {
+      settingsHeader(TR("CHOOSE DATA", "Выбор данных"));
+      for (int i = 0; i < M_COUNT; i++)
+        btn(8 + (i % 2) * 116, 36 + (i / 2) * 50, 108, 44, metricName(i), cfg.card[pickSlot] == i);
+      snprintf(b, sizeof(b), TR("Card %d", "Карточка %d"), pickSlot + 1);
+      secLabel(8, 244, b);
+      break;
+    }
+    case S_CAL: {
+      static const int TX[3] = {CAL_M, 239 - CAL_M, CAL_M};
+      static const int TY[3] = {CAL_M, CAL_M, 319 - CAL_M};
+      tft.setTextDatum(MC_DATUM);
+      tft.setTextPadding(0);
+      tft.setTextColor(COL_TXT, COL_BG);
+      drawS(TR("TOUCH CALIBRATION", "Калибровка тача"), 120, 120, 2);
+      snprintf(b, sizeof(b), TR("Tap the target (%d / 3)", "Коснитесь метки (%d / 3)"), calStep + 1);
+      tft.setTextColor(COL_DIM, COL_BG);
+      drawS(b, 120, 150, 2);
+      if (calFail) { tft.setTextColor(COL_BAD, COL_BG); drawS(TR("Points too close - try again", "Слишком близко, повторите"), 120, 176, 2); }
+      tft.setTextColor(COL_DIM, COL_BG);
+      drawS(cfg.cal.valid ? TR("BOOT button = cancel", "Кнопка BOOT: отмена") : TR("A stylus gives best accuracy", "Лучше использовать стилус"), 120, 200, 1);
+      int x = TX[calStep], y = TY[calStep];
+      tft.drawCircle(x, y, 10, COL_ACCENT);
+      tft.drawCircle(x, y, 5, COL_ACCENT);
+      tft.drawFastHLine(x - 16, y, 33, COL_ACCENT);
+      tft.drawFastVLine(x, y - 16, 33, COL_ACCENT);
+      break;
+    }
+    default: break;
   }
 }
 
 // ---------- Диспетчер экрана ----------
 void drawUi() {
   bool live = connected && authState == AUTH_READY;
-  int mode = live ? 1 + page : 0;
+  int mode = scr != S_MAIN ? 100 + (int)scr : (live ? 1 + page : 0);
   if (mode != uiMode) {
     uiMode = mode;
     clearCache();
     tft.fillScreen(COL_BG);
-    drawHeaderStatic(mode > 0);
-    stDirty = true;
-    if (mode == 1) dashStatic();
-    else if (mode == 2) infoStatic();
-    else if (mode == 3) debugStatic();
+    if (scr == S_MAIN) {
+      drawHeaderStatic(mode > 0);
+      stDirty = true;
+      if (mode == 0) connectStatic();
+      else if (mode == 1) dashStatic();
+      else if (mode == 2) infoStatic();
+      else debugStatic();
+    } else {
+      drawSettingsScreen();
+    }
   }
+  if (scr != S_MAIN) return;
   if (stDirty) drawStatus();
   if (mode == 0) connectDynamic();
   else if (mode == 1) dashDynamic();
   else if (mode == 2) infoDynamic();
   else debugDynamic();
+}
+
+// =====================================================================
+//                         ОБРАБОТКА КАСАНИЙ
+// =====================================================================
+void goScr(Scr s) { scr = s; uiMode = -1; }
+void openSettings() { goScr(S_SET); }
+void leaveSettings() { goScr(S_MAIN); }
+void openPicker(uint8_t slot, Scr ret) { pickSlot = slot; pickReturn = ret; goScr(S_PICK); }
+
+void goBack() {
+  switch (scr) {
+    case S_SET: leaveSettings(); break;
+    case S_PICK: if (pickReturn == S_MAIN) leaveSettings(); else goScr(S_WIDGETS); break;
+    case S_CAL: if (cfg.cal.valid) goScr(calFromBoot ? S_MAIN : S_SET); break;
+    default: goScr(S_SET); break;
+  }
+}
+
+void applyDisplayCfg() {
+  tft.setRotation(cfg.flip ? 2 : 0);
+  setBacklight(cfg.bright);
+  applyTheme();
+}
+
+bool finishCal() {
+  float ax0, ax1, ay0, ay1;
+  bool sw = fabsf(calRaw[1][1] - calRaw[0][1]) > fabsf(calRaw[1][0] - calRaw[0][0]);
+  ax0 = sw ? calRaw[0][1] : calRaw[0][0];
+  ax1 = sw ? calRaw[1][1] : calRaw[1][0];
+  ay0 = sw ? calRaw[0][0] : calRaw[0][1];
+  ay1 = sw ? calRaw[2][0] : calRaw[2][1];
+  if (fabsf(ax1 - ax0) < 300 || fabsf(ay1 - ay0) < 300) return false;
+  cfg.cal.swap = sw;
+  cfg.cal.x0 = ax0;
+  cfg.cal.xk = (239 - 2 * CAL_M) / (ax1 - ax0);
+  cfg.cal.y0 = ay0;
+  cfg.cal.yk = (319 - 2 * CAL_M) / (ay1 - ay0);
+  cfg.cal.flip = cfg.flip;
+  cfg.cal.valid = 1;
+  return true;
+}
+
+void touchCal() {
+  if (!tch.evUp || tch.rN < 3) return;
+  calRaw[calStep][0] = (float)tch.rAx / tch.rN;
+  calRaw[calStep][1] = (float)tch.rAy / tch.rN;
+  calStep++;
+  if (calStep >= 3) {
+    if (finishCal()) {
+      saveSettings();
+      goScr(calFromBoot ? S_MAIN : S_SET);
+      calFromBoot = false;
+      calFail = false;
+      calStep = 0;
+      return;
+    }
+    calStep = 0;
+    calFail = true;
+  } else {
+    calFail = false;
+  }
+  uiMode = -1;
+}
+
+void touchMain() {
+  const bool live = connected && authState == AUTH_READY;
+  const bool locked = cfg.lock && live && d.speed > 3.0f;
+  if (tch.swipe && live) { nextPage(tch.swipe > 0 ? 1 : -1); return; }
+  if (locked) return;
+  const bool onDash = live && page == 0;
+  if (tch.evTap) {
+    int x = tch.sx, y = tch.sy;
+    if (hit(x, y, 196, 0, 44, 44)) { openSettings(); return; }
+    if (live && hit(x, y, 150, 0, 46, 44)) { nextPage(1); uiMode = -1; return; }
+    if (onDash) {
+      for (int i = 0; i < 4; i++)
+        if (hit(x, y, CX[i], CY[i], 108, 50)) {
+          cfg.card[i] = (cfg.card[i] + 1) % M_COUNT;
+          queueSave();
+          uiMode = -1;
+          return;
+        }
+      if (hit(x, y, 0, 44, 240, 158)) { cfg.units ^= 1; queueSave(); uiMode = -1; return; }
+    }
+  }
+  if (tch.evLong && onDash) {
+    for (int i = 0; i < 4; i++)
+      if (hit(tch.sx, tch.sy, CX[i], CY[i], 108, 50)) { openPicker(i, S_MAIN); return; }
+  }
+}
+
+void touchSettings() {
+  static int dragId = -1;
+  // ---- ползунки (перетаскивание) ----
+  if (tch.evDown) {
+    dragId = -1;
+    if (scr == S_APPEAR && hit(tch.sx, tch.sy, 0, 196, 240, 50)) dragId = 1;
+    else if (scr == S_DISPLAY && hit(tch.sx, tch.sy, 0, 44, 240, 50)) dragId = 2;
+  }
+  if (dragId >= 0) {
+    float f = constrain((tch.x - 10) / 220.0f, 0.0f, 1.0f);
+    if (dragId == 1) {
+      int h = (int)(f * 359);
+      if (h != cfg.hue || cfg.accent != 8) { cfg.hue = h; cfg.accent = 8; drawHueSlider(); }
+    } else {
+      int bv = 10 + (int)(f * 90);
+      if (bv != cfg.bright) { cfg.bright = bv; setBacklight(bv); drawBrightness(); }
+    }
+    if (!tch.down) {
+      int id = dragId;
+      dragId = -1;
+      queueSave();
+      if (id == 1) { applyTheme(); uiMode = -1; }
+    }
+    return;
+  }
+
+  if (tch.swipe) return;
+  const int x = tch.sx, y = tch.sy;
+
+  if (tch.evTap && hit(x, y, 0, 0, 80, 32)) { goBack(); return; }
+
+  switch (scr) {
+    case S_SET:
+      for (int i = 0; i < 7; i++) {
+        if (!hit(x, y, 8, 34 + i * 41, 224, 36)) continue;
+        if (tch.evTap) {
+          if (i <= 3) goScr((Scr)(S_APPEAR + i));
+          else if (i == 4) { cfg.lang ^= 1; queueSave(); uiMode = -1; }      // язык переключается сразу
+          else if (i == 5) { calStep = 0; calFail = false; calFromBoot = false; goScr(S_CAL); }
+        }
+        if (tch.evLong && i == 6) {
+          setDefaults(true);
+          applyDisplayCfg();
+          saveSettings();
+          uiMode = -1;
+        }
+      }
+      break;
+
+    case S_APPEAR:
+      if (!tch.evTap) break;
+      for (int i = 0; i < 4; i++)
+        if (hit(x, y, 8 + i * 58, 48, 54, 40)) { cfg.theme = i; applyTheme(); queueSave(); uiMode = -1; return; }
+      for (int i = 0; i < 8; i++)
+        if (hit(x, y, 8 + (i % 4) * 58, 110 + (i / 4) * 38, 54, 34)) { cfg.accent = i; applyTheme(); queueSave(); uiMode = -1; return; }
+      break;
+
+    case S_DISPLAY:
+      if (!tch.evTap) break;
+      for (int i = 0; i < 4; i++)
+        if (hit(x, y, 8 + i * 58, 110, 54, 40)) { cfg.dim = i; queueSave(); uiMode = -1; return; }
+      if (hit(x, y, 8, 172, 108, 40))   { cfg.flip = 0; applyDisplayCfg(); queueSave(); uiMode = -1; }
+      if (hit(x, y, 124, 172, 108, 40)) { cfg.flip = 1; applyDisplayCfg(); queueSave(); uiMode = -1; }
+      if (hit(x, y, 8, 234, 108, 40))   { cfg.lock = 1; queueSave(); uiMode = -1; }
+      if (hit(x, y, 124, 234, 108, 40)) { cfg.lock = 0; queueSave(); uiMode = -1; }
+      break;
+
+    case S_GAUGE: {
+      if (!tch.evTap) break;
+      uint8_t& gm = cfg.units ? cfg.gmaxMph : cfg.gmaxKmh;
+      if (hit(x, y, 8, 48, 108, 44))   { cfg.units = 0; }
+      else if (hit(x, y, 124, 48, 108, 44)) { cfg.units = 1; }
+      else if (hit(x, y, 8, 116, 64, 44))   { if (gm > 15) gm -= 3; }
+      else if (hit(x, y, 168, 116, 64, 44)) { if (gm < 60) gm += 3; }
+      else if (hit(x, y, 8, 184, 72, 44))   { cfg.style = 0; }
+      else if (hit(x, y, 84, 184, 72, 44))  { cfg.style = 1; }
+      else if (hit(x, y, 160, 184, 72, 44)) { cfg.style = 2; }
+      else break;
+      queueSave();
+      uiMode = -1;
+      break;
+    }
+
+    case S_WIDGETS:
+      if (!tch.evTap) break;
+      for (int i = 0; i < 4; i++)
+        if (hit(x, y, 8 + (i % 2) * 116, 48 + (i / 2) * 70, 108, 64)) { openPicker(i, S_WIDGETS); return; }
+      if (hit(x, y, 8, 206, 108, 44))   { cfg.showInfo ^= 1; page = 0; queueSave(); uiMode = -1; }
+      if (hit(x, y, 124, 206, 108, 44)) { cfg.showDebug ^= 1; page = 0; queueSave(); uiMode = -1; }
+      break;
+
+    case S_PICK:
+      if (!tch.evTap) break;
+      for (int i = 0; i < M_COUNT; i++)
+        if (hit(x, y, 8 + (i % 2) * 116, 36 + (i / 2) * 50, 108, 44)) {
+          cfg.card[pickSlot] = i;
+          queueSave();
+          if (pickReturn == S_MAIN) leaveSettings(); else goScr(S_WIDGETS);
+          return;
+        }
+      break;
+
+    default: break;
+  }
+}
+
+void handleTouch() {
+  touchUpdate();
+  if (scr == S_MAIN) touchMain();
+  else if (scr == S_CAL) touchCal();
+  else touchSettings();
+}
+
+void housekeeping() {
+  uint32_t now = millis();
+  if (saveDue && (int32_t)(now - saveAt) >= 0) { saveDue = false; saveSettings(); }
+  if (connected && authState == AUTH_READY && d.speed > 1.0f) markActivity();   // в движении не гасим экран
+  if (cfg.dim && !dimmed && now - lastAct > (uint32_t)DIM_SEC[cfg.dim] * 1000UL) {
+    dimmed = true;
+    setBacklight(max(5, (int)cfg.bright / 6));
+  }
+  if (connected && authState == AUTH_READY && d.speed > sessionMax) sessionMax = d.speed;
+}
+
+void handleButton() {
+  static uint32_t downAt = 0;
+  static bool wasDown = false;
+  bool down = digitalRead(BTN_PIN) == LOW;
+  if (down && !wasDown) { downAt = millis(); markActivity(); }
+  if (!down && wasDown) {
+    uint32_t dt = millis() - downAt;
+    if (dt > 1500) { if (client && client->isConnected()) client->disconnect(); connected = false; }
+    else if (dt > 40) {
+      if (scr == S_MAIN) nextPage(1);
+      else goBack();
+    }
+  }
+  wasDown = down;
+}
+
+// Один «тик» интерфейса: кнопка, тач, подсветка, перерисовка. Зовётся и из долгих ожиданий BLE.
+void uiTick() {
+  static uint32_t lastDraw = 0;
+  handleButton();
+  handleTouch();
+  housekeeping();
+  uint32_t now = millis();
+  if (now - lastDraw >= 90) { lastDraw = now; drawUi(); }
+}
+
+void idleWait(uint32_t ms) {
+  uint32_t t = millis();
+  while (millis() - t < ms) { uiTick(); delay(4); }
 }
 
 // ---------- BLE ----------
@@ -867,12 +1675,17 @@ bool scanAndConnect() {
   drawUi();
   NimBLEScan* sc = NimBLEDevice::getScan();
   sc->setActiveScan(true);
-  NimBLEScanResults r = sc->start(4, false);
+  sc->clearResults();
+  // Скан не блокирует цикл: пока он идёт, интерфейс и тач продолжают работать.
+  sc->start(4, nullptr, false);
+  uint32_t t0 = millis();
+  while (sc->isScanning() && millis() - t0 < 6000) { uiTick(); delay(4); }
+  NimBLEScanResults r = sc->getResults();
   NimBLEAddress best; bool found = false; int bestRssi = -999; String bestName;
-  for (auto it = r.begin(); it != r.end(); ++it) {
-    NimBLEAdvertisedDevice* a = *it;
-    if (!nameMatches(a->getName())) continue;
-    if (a->getRSSI() > bestRssi) { bestRssi = a->getRSSI(); best = a->getAddress(); bestName = a->getName().c_str(); found = true; }
+  for (int i = 0; i < r.getCount(); i++) {
+    NimBLEAdvertisedDevice a = r.getDevice(i);
+    if (!nameMatches(a.getName())) continue;
+    if (a.getRSSI() > bestRssi) { bestRssi = a.getRSSI(); best = a.getAddress(); bestName = a.getName().c_str(); found = true; }
   }
   sc->clearResults();
   if (!found) { statusNow("not found", COL_BAD); return false; }
@@ -894,7 +1707,7 @@ bool scanAndConnect() {
   rxLen = 0; rxExpected = 0; lastRx = millis(); connected = true; d.valid = 0;
   txCounter = 0; rxCounter = 0; pressPowerRequired = false;
   authState = AUTH_WAIT_INIT; pendingTx = TX_INIT; authLastSend = millis();
-  d.totalLow = 0; d.totalHigh = 0; d.tripKm = 0;
+  d.totalLow = 0; d.totalHigh = 0; d.tripKm = 0; sessionMax = 0;
   memset(d.serial, 0, sizeof(d.serial)); d.fw = 0;
   status("AUTH INIT", COL_ACCENT);
   return true;
@@ -904,36 +1717,35 @@ bool scanAndConnect() {
 void setup() {
   Serial.begin(115200);
   pinMode(BTN_PIN, INPUT_PULLUP);
+  loadSettings();
+  applyTheme();
   tft.init();
-  tft.setRotation(0);  // портретная ориентация, 240x320
+  tft.setRotation(cfg.flip ? 2 : 0);   // портрет 240x320 (0 или 180°)
+  ledcSetup(BL_CH, 5000, 8);
+  ledcAttachPin(BL_PIN, BL_CH);
+  setBacklight(cfg.bright);
+  touchSPI.begin(TOUCH_CLK, TOUCH_MISO, TOUCH_MOSI, TOUCH_CS);
+  ts.begin(touchSPI);
+  ts.setRotation(0);
+  if (!cfg.cal.valid) { scr = S_CAL; calStep = 0; calFromBoot = true; }   // первый запуск: калибровка
   tft.fillScreen(COL_BG);
   clearCache();
+  lastAct = millis();
   drawUi();
   NimBLEDevice::init("");
   NimBLEDevice::setPower(ESP_PWR_LVL_P9);
   Serial.println("Ninebot G30/ES4 dashboard; encrypted handshake required");
 }
 
-void handleButton() {
-  static uint32_t downAt = 0;
-  static bool wasDown = false;
-  bool down = digitalRead(BTN_PIN) == LOW;
-  if (down && !wasDown) downAt = millis();
-  if (!down && wasDown) {
-    uint32_t dt = millis() - downAt;
-    if (dt > 1500) { if (client && client->isConnected()) client->disconnect(); connected = false; }
-    else if (dt > 40) { page = (page + 1) % 3; }
-  }
-  wasDown = down;
-}
-
 void loop() {
   static uint32_t lastPoll = 0, lastDraw = 0;
   static int idx = 0;
   handleButton();
+  handleTouch();
+  housekeeping();
 
   if (!connected) {
-    if (!scanAndConnect()) { drawUi(); delay(1500); return; }
+    if (!scanAndConnect()) { drawUi(); idleWait(1500); return; }
   }
 
   uint32_t now = millis();

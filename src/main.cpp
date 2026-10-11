@@ -12,6 +12,7 @@
 #include <SPI.h>
 #include <Preferences.h>
 #include <XPT2046_Touchscreen.h>
+#include <Adafruit_NeoPixel.h>
 #include "ru_fonts.h"   // кириллица для TFT_eSPI (генерируется tools/gen_ru_font.py)
 
 // ---------- Настройки ----------
@@ -28,6 +29,14 @@
 #define ETEMP_SCALE    0.1f    // рег. 0x3E -> °C
 #define BMS_CUR_SCALE  0.01f   // А
 #define BMS_VOLT_SCALE 0.01f   // В
+#define BRAKE_DROP_KMH 8.0f
+#define BRAKE_WINDOW_MS 500
+#define BRAKE_HOLD_MS 1000
+#define SPEED_POLL_MS 200
+#define LED_MAX_COUNT 120
+
+static const uint8_t LED_PINS[] = {4, 16, 17, 22, 26, 27};
+static const uint8_t LED_PIN_COUNT = sizeof(LED_PINS) / sizeof(LED_PINS[0]);
 
 // ---------- Палитра (меняется темой из настроек, см. applyTheme) ----------
 constexpr uint16_t C565(uint8_t r, uint8_t g, uint8_t b) {
@@ -55,11 +64,10 @@ static NimBLEUUID NUS_RX ("6e400003-b5a3-f393-e0a9-e50e24dcca9e");  // увед�
 #define ADDR_ESC 0x20
 #define ADDR_BMS 0x22
 
-enum Id : uint8_t { SPEED, TRIP, TOTAL_LO, TOTAL_HI, ETEMP, SOC, AMP, VOLT, BTEMP, SERIAL_NO, FW };
+enum Id : uint8_t { SPEED, TRIP, TOTAL_LO, TOTAL_HI, ETEMP, SOC, AMP, VOLT, BTEMP, SERIAL_NO, FW, RIDE_MODE };
 struct Item { uint8_t dev, reg, len; Id id; };
 
 static const Item pollList[] = {
-  {ADDR_ESC, 0x26, 2, SPEED},
   {ADDR_BMS, 0x32, 2, SOC},
   {ADDR_BMS, 0x33, 2, AMP},
   {ADDR_BMS, 0x34, 2, VOLT},
@@ -70,6 +78,7 @@ static const Item pollList[] = {
   {ADDR_ESC, 0x2A, 2, TOTAL_HI},
   {ADDR_ESC, 0x10, 14, SERIAL_NO},
   {ADDR_ESC, 0x1A, 2, FW},
+  {ADDR_ESC, 0x75, 2, RIDE_MODE},
 };
 static const int POLL_N = sizeof(pollList) / sizeof(pollList[0]);
 
@@ -80,9 +89,32 @@ struct Data {
   uint16_t fw = 0;
   uint16_t valid = 0;
   uint16_t totalLow = 0, totalHigh = 0;
+  uint16_t rideMode = 0;
 } d;
 
+enum LedEffect : uint8_t { LED_OFF, LED_SOLID, LED_PULSE, LED_RAINBOW, LED_EFFECT_COUNT };
+struct LedSettings {
+  uint8_t enabled = 0, pinIndex = 3, count = 30;
+  uint8_t segmentCount[3] = {10, 10, 10};
+  uint8_t effect[3] = {LED_SOLID, LED_PULSE, LED_RAINBOW};
+  uint8_t color[3] = {0, 7, 1};
+} ledCfg;
+
+static const uint32_t LED_COLORS[] = {
+  0x00C8FF, 0x4678FF, 0xAA5AFF, 0xFF50AA,
+  0xFF4646, 0xFF8C1E, 0xFFD228, 0x3CE178
+};
+static const char* const LED_EFFECT_NAMES[] = {"OFF", "SOLID", "PULSE", "RAINBOW"};
+static const char* const LED_EFFECT_NAMES_RU[] = {"ВЫКЛ", "ЦВЕТ", "ПУЛЬС", "РАДУГА"};
+
 TFT_eSPI tft;
+Adafruit_NeoPixel ledStrip(30, LED_PINS[3], NEO_GRB + NEO_KHZ800);
+static bool ledReady = false;
+static uint32_t brakeUntil = 0;
+static float speedHistory[4] = {};
+static uint32_t speedHistoryAt[4] = {};
+static uint8_t speedHistoryNext = 0;
+static uint8_t speedHistoryCount = 0;
 NimBLEClient* client = nullptr;
 NimBLERemoteCharacteristic *txChr = nullptr, *rxChr = nullptr;
 volatile bool connected = false;
@@ -121,6 +153,20 @@ static uint32_t lastCommand = 0;
 
 static inline uint16_t u16(const uint8_t* p) { return p[0] | (p[1] << 8); }
 static inline int16_t  s16(const uint8_t* p) { return (int16_t)u16(p); }
+static void recordSpeed(float speed) {
+  uint32_t now = millis();
+  for (uint8_t i = 0; i < speedHistoryCount; i++) {
+    if (now - speedHistoryAt[i] <= BRAKE_WINDOW_MS &&
+        speedHistory[i] - speed >= BRAKE_DROP_KMH) {
+      brakeUntil = now + BRAKE_HOLD_MS;
+      break;
+    }
+  }
+  speedHistory[speedHistoryNext] = speed;
+  speedHistoryAt[speedHistoryNext] = now;
+  speedHistoryNext = (speedHistoryNext + 1) % 4;
+  if (speedHistoryCount < 4) speedHistoryCount++;
+}
 static const uint8_t FW_DATA[16] = {
   0x97, 0xCF, 0xB8, 0x02, 0x84, 0x41, 0x43, 0xDE,
   0x56, 0x00, 0x2B, 0x3B, 0x34, 0x78, 0x0A, 0x5D
@@ -360,6 +406,12 @@ void handlePlainFrame(const uint8_t* f, size_t n) {
 
   if (dst != ADDR_APP || cmd != 0x04 || authState != AUTH_READY || n < 7 + len) return;
   const uint8_t* p = f + 7;
+  if (src == ADDR_ESC && arg == 0x26 && len >= 2) {
+    d.speed = fabsf(s16(p) * SPEED_SCALE);
+    d.valid |= (uint16_t)(1U << SPEED);
+    recordSpeed(d.speed);
+    return;
+  }
   Serial.printf("RX REG dev=%02X reg=%02X len=%u data=", src, arg, len);
   for (uint8_t i = 0; i < len; i++) Serial.printf("%02X", p[i]);
   Serial.println();
@@ -367,7 +419,6 @@ void handlePlainFrame(const uint8_t* f, size_t n) {
     const Item& it = pollList[i];
     if (it.dev != src || it.reg != arg || len < it.len) continue;
     switch (it.id) {
-      case SPEED: d.speed = fabsf(s16(p) * SPEED_SCALE); break;
       case TRIP: d.tripKm = u16(p) * TRIP_SCALE; break;
       case TOTAL_LO:
         d.totalLow = u16(p);
@@ -384,6 +435,7 @@ void handlePlainFrame(const uint8_t* f, size_t n) {
       case BTEMP: d.battTemp = ((int)p[0] + (int)p[1]) / 2 - 20; break;
       case SERIAL_NO: memcpy(d.serial, p, 14); d.serial[14] = 0; break;
       case FW: d.fw = u16(p); break;
+      case RIDE_MODE: d.rideMode = u16(p); break;
     }
     d.valid |= (uint16_t)(1U << it.id);
   }
@@ -627,6 +679,7 @@ void setDefaults(bool keepCal) {
 }
 
 static Preferences prefs;
+static Preferences ledPrefs;
 static bool saveDue = false;
 static uint32_t saveAt = 0;
 
@@ -647,6 +700,103 @@ void saveSettings() {
 }
 void queueSave() { saveDue = true; saveAt = millis() + 1200; }
 
+uint8_t ledPin() { return LED_PINS[ledCfg.pinIndex]; }
+
+void applyLedHardware() {
+  ledStrip.setPin(ledPin());
+  ledStrip.updateLength(ledCfg.count);
+  ledStrip.begin();
+  ledStrip.setBrightness(64);
+  ledStrip.clear();
+  ledStrip.show();
+  ledReady = true;
+}
+
+void loadLedSettings() {
+  if (!ledPrefs.begin("opendashled", false)) {
+    Serial.println("ERROR: cannot open LED settings");
+    return;
+  }
+  if (ledPrefs.getBytesLength("config") == sizeof(ledCfg)) {
+    LedSettings saved;
+    if (ledPrefs.getBytes("config", &saved, sizeof(saved)) == sizeof(saved) &&
+        saved.enabled <= 1 && saved.pinIndex < LED_PIN_COUNT &&
+        saved.count >= 1 && saved.count <= LED_MAX_COUNT) {
+      uint16_t allocated = 0;
+      bool valid = true;
+      for (uint8_t i = 0; i < 3; i++) {
+        valid &= saved.segmentCount[i] <= LED_MAX_COUNT;
+        valid &= saved.effect[i] < LED_EFFECT_COUNT;
+        valid &= saved.color[i] < sizeof(LED_COLORS) / sizeof(LED_COLORS[0]);
+        allocated += saved.segmentCount[i];
+      }
+      if (valid && allocated <= saved.count) ledCfg = saved;
+    }
+  }
+  ledPrefs.end();
+}
+
+void saveLedSettings() {
+  if (!ledPrefs.begin("opendashled", false)) {
+    Serial.println("ERROR: cannot open LED settings for saving");
+    return;
+  }
+  size_t saved = ledPrefs.putBytes("config", &ledCfg, sizeof(ledCfg));
+  ledPrefs.end();
+  if (saved != sizeof(ledCfg)) Serial.println("ERROR: failed to save LED settings");
+}
+
+void serviceLedStrip() {
+  static uint32_t lastFrame = 0;
+  static bool wasLit = false;
+  uint32_t now = millis();
+  if (!ledReady || now - lastFrame < 40) return;
+  lastFrame = now;
+
+  if (!ledCfg.enabled) {
+    if (wasLit) {
+      ledStrip.clear();
+      ledStrip.show();
+      wasLit = false;
+    }
+    return;
+  }
+
+  wasLit = true;
+  bool braking = brakeUntil && (int32_t)(brakeUntil - now) > 0;
+  if (braking) {
+    for (uint16_t pixel = 0; pixel < ledCfg.count; pixel++)
+      ledStrip.setPixelColor(pixel, ledStrip.Color(255, 0, 0));
+    ledStrip.show();
+    return;
+  }
+  ledStrip.clear();
+  for (uint8_t segment = 0; segment < 3; segment++) {
+    uint16_t start = 0;
+    for (uint8_t i = 0; i < segment; i++) start += ledCfg.segmentCount[i];
+    uint16_t end = min((uint16_t)ledCfg.count, (uint16_t)(start + ledCfg.segmentCount[segment]));
+    for (uint16_t pixel = start; pixel < end; pixel++) {
+      uint32_t color = 0;
+      uint8_t effect = ledCfg.effect[segment];
+      if (effect == LED_SOLID) {
+        color = LED_COLORS[ledCfg.color[segment]];
+      } else if (effect == LED_PULSE) {
+        float phase = (sinf(now * 0.004f) + 1.0f) * 0.5f;
+        float level = 0.12f + phase * 0.88f;
+        uint32_t base = LED_COLORS[ledCfg.color[segment]];
+        color = ledStrip.Color(
+          (uint8_t)(((base >> 16) & 0xFF) * level),
+          (uint8_t)(((base >> 8) & 0xFF) * level),
+          (uint8_t)((base & 0xFF) * level));
+      } else if (effect == LED_RAINBOW) {
+        color = ledStrip.ColorHSV((uint16_t)(now * 12 + pixel * 65535UL / ledCfg.count));
+      }
+      ledStrip.setPixelColor(pixel, color);
+    }
+  }
+  ledStrip.show();
+}
+
 // Единицы измерения (внутри всё хранится в км/ч и км)
 static inline float kmU(float km) { return cfg.units ? km * 0.621371f : km; }
 static inline const char* uSpd() { return cfg.units ? TR("mph", "миль/ч") : TR("km/h", "км/ч"); }
@@ -659,7 +809,7 @@ void nextPage(int dir) {
 }
 
 // ---------- Экраны ----------
-enum Scr : uint8_t { S_MAIN, S_SET, S_APPEAR, S_DISPLAY, S_GAUGE, S_WIDGETS, S_PICK, S_CAL };
+enum Scr : uint8_t { S_MAIN, S_SET, S_APPEAR, S_DISPLAY, S_GAUGE, S_WIDGETS, S_LED, S_PICK, S_CAL };
 static Scr scr = S_MAIN;
 static Scr pickReturn = S_WIDGETS;
 static uint8_t pickSlot = 0;
@@ -935,6 +1085,26 @@ void drawBar(int x, int y, int lit, uint16_t col) {
 
 struct CardOut { String v, sub; uint16_t col; int bar; };
 
+String rideModeLabel() {
+  if (!(d.valid & (1U << RIDE_MODE))) return "--";
+  switch (d.rideMode) {
+    case 0: return TR("DRIVE", "ДРАЙВ");
+    case 1: return TR("ECO", "ЭКО");
+    case 2: return TR("SPORT", "СПОРТ");
+    default: return String(TR("MODE ", "РЕЖИМ ")) + String(d.rideMode);
+  }
+}
+
+uint16_t rideModeColor() {
+  if (!(d.valid & (1U << RIDE_MODE))) return COL_DIM;
+  switch (d.rideMode) {
+    case 0: return COL_ACCENT;
+    case 1: return COL_GOOD;
+    case 2: return COL_WARN;
+    default: return COL_DIM;
+  }
+}
+
 CardOut metricOut(uint8_t m) {
   CardOut o;
   o.v = "--"; o.sub = " "; o.col = COL_DIM; o.bar = -1;
@@ -995,6 +1165,7 @@ void dashDynamic() {
 
   updateGauge(hasSpeed ? kmU(d.speed) : 0);
   field(0, GCX, GCY - 8, hasSpeed ? String(kmU(d.speed), 1) : String("--"), 120, 7, COL_TXT, MC_DATUM, COL_BG);
+  field(10, GCX, GCY + 40, rideModeLabel(), 100, 2, rideModeColor(), MC_DATUM, COL_BG);
   field(1, GCX, 188, hasTotal ? TR("ODO ", "ОДО ") + String(kmU(d.totalKm), 1) + " " + uDst() : String(TR("ODO -- ", "ОДО -- ")) + uDst(), 150, 2, COL_DIM, MC_DATUM, COL_BG);
 
   for (int i = 0; i < 4; i++) {
@@ -1159,6 +1330,16 @@ void btn(int x, int y, int w, int h, const char* txt, bool sel, int font = 2) {
   drawS(txt, x + w / 2, y + h / 2, font);
 }
 
+void btnText(int x, int y, int w, int h, const String& txt, bool sel, int font = 2) {
+  uint16_t fill = sel ? COL_ACCENT : COL_PANEL;
+  uint16_t fg = sel ? COL_BG : COL_TXT;
+  tft.fillRoundRect(x, y, w, h, 6, fill);
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(fg, fill);
+  tft.setTextPadding(0);
+  drawS(txt, x + w / 2, y + h / 2, font);
+}
+
 void secLabel(int x, int y, const char* s) {
   tft.setTextDatum(TL_DATUM);
   tft.setTextColor(COL_DIM, COL_BG);
@@ -1205,20 +1386,27 @@ void drawGaugePreview() {
   for (int i = 0; i < GAUGE_SEGS; i++) tft.fillRect(20 + i * 5, 250, 4, 18, gaugeColor(i));
 }
 
+uint16_t ledSegmentStart(uint8_t segment) {
+  uint16_t start = 0;
+  for (uint8_t i = 0; i < segment; i++) start += ledCfg.segmentCount[i];
+  return start;
+}
+
 void drawSettingsScreen() {
   char b[56];
   switch (scr) {
     case S_SET: {
       settingsHeader(TR("SETTINGS", "Настройки"));
-      const char* titles[7] = {TR("APPEARANCE", "Внешний вид"), TR("DISPLAY", "Экран"), TR("GAUGE & UNITS", "Шкала и единицы"),
+      const char* titles[8] = {TR("APPEARANCE", "Внешний вид"), TR("DISPLAY", "Экран"), TR("GAUGE & UNITS", "Шкала и единицы"),
                                TR("WIDGETS & PAGES", "Виджеты и страницы"), TR("LANGUAGE", "Язык"),
-                               TR("TOUCH CALIBRATION", "Калибровка тача"), TR("RESET TO DEFAULTS", "Сброс настроек")};
+                               TR("TOUCH CALIBRATION", "Калибровка тача"), TR("ARGB LED STRIP", "ARGB-лента"),
+                               TR("RESET TO DEFAULTS", "Сброс настроек")};
       char dm[10];
       if (cfg.dim) snprintf(dm, sizeof(dm), TR("%ds", "%d с"), DIM_SEC[cfg.dim]); else strcpy(dm, TR("off", "выкл"));
       const char* tn = cfg.lang ? THEMES[cfg.theme].nameRu : THEMES[cfg.theme].name;
       const char* an = cfg.accent < 8 ? (cfg.lang ? ACCENT_NAME_RU[cfg.accent] : ACCENT_NAME[cfg.accent]) : TR("custom", "свой");
       const char* sn = cfg.lang ? STYLE_NAME_RU[cfg.style] : STYLE_NAME[cfg.style];
-      char sub[7][56];
+      char sub[8][56];
       snprintf(sub[0], 56, TR("%s theme, %s accent", "%s, акцент: %s"), tn, an);
       snprintf(sub[1], 56, TR("brightness %d%%, auto-dim %s", "яркость %d%%, затемнение: %s"), cfg.bright, dm);
       snprintf(sub[2], 56, TR("%s, max %d, %s gauge", "%s, макс. %d, шкала: %s"), uSpd(), gmax(), sn);
@@ -1226,20 +1414,22 @@ void drawSettingsScreen() {
                cfg.showInfo ? TR("on", "вкл") : TR("off", "выкл"), cfg.showDebug ? TR("on", "вкл") : TR("off", "выкл"));
       snprintf(sub[4], 56, "%s", cfg.lang ? "Русский (нажмите: English)" : "English (tap: Русский)");
       snprintf(sub[5], 56, "%s", TR("re-map the touch panel (3 taps)", "откалибровать сенсор (3 касания)"));
-      snprintf(sub[6], 56, "%s", TR("press and HOLD to restore defaults", "удерживайте для сброса"));
-      for (int i = 0; i < 7; i++) {
-        int y = 34 + i * 41;
-        tft.fillRoundRect(8, y, 224, 36, 6, COL_PANEL);
-        tft.fillRect(8, y + 7, 3, 22, i == 6 ? COL_BAD : COL_ACCENT);
+      snprintf(sub[6], 56, TR("%d LEDs, GPIO %d, %s", "%d светодиодов, GPIO %d, %s"),
+               (int)ledCfg.count, (int)ledPin(), ledCfg.enabled ? TR("on", "вкл") : TR("off", "выкл"));
+      snprintf(sub[7], 56, "%s", TR("press and HOLD to restore defaults", "удерживайте для сброса"));
+      for (int i = 0; i < 8; i++) {
+        int y = 34 + i * 35;
+        tft.fillRoundRect(8, y, 224, 32, 6, COL_PANEL);
+        tft.fillRect(8, y + 5, 3, 22, i == 7 ? COL_BAD : COL_ACCENT);
         tft.setTextDatum(TL_DATUM);
         tft.setTextPadding(0);
-        tft.setTextColor(i == 6 ? COL_BAD : COL_TXT, COL_PANEL);
-        drawS(titles[i], 20, y + 3, 2);
+        tft.setTextColor(i == 7 ? COL_BAD : COL_TXT, COL_PANEL);
+        drawS(titles[i], 20, y + 1, 2);
         tft.setTextColor(COL_DIM, COL_PANEL);
-        drawS(sub[i], 20, y + 22, 1);
+        drawS(sub[i], 20, y + 19, 1);
         if (i != 4) {
-          tft.drawLine(216, y + 12, 222, y + 18, COL_DIM);
-          tft.drawLine(222, y + 18, 216, y + 24, COL_DIM);
+          tft.drawLine(216, y + 10, 222, y + 16, COL_DIM);
+          tft.drawLine(222, y + 16, 216, y + 22, COL_DIM);
         }
       }
       break;
@@ -1337,6 +1527,45 @@ void drawSettingsScreen() {
       secLabel(8, 262, TR("On the dashboard: tap a card = next data,", "Нажатие на карточку: следующие данные,"));
       secLabel(8, 274, TR("hold a card = pick from list,", "удержание: выбор из списка,"));
       secLabel(8, 286, TR("tap the gauge = switch km/h / mph.", "нажатие на шкалу: км/ч / миль/ч."));
+      break;
+    }
+    case S_LED: {
+      settingsHeader(TR("ARGB LED STRIP", "ARGB-лента"));
+      secLabel(8, 33, TR("TOTAL LEDS", "Всего светодиодов"));
+      btn(8, 44, 58, 30, "-", false, 2);
+      btnText(74, 44, 92, 30, String(ledCfg.count) + " LED", false, 1);
+      btn(174, 44, 58, 30, "+", false, 2);
+
+      secLabel(8, 78, TR("DATA PIN (tap to change)", "ПИН ДАННЫХ (нажмите)"));
+      btnText(8, 88, 224, 27, String("GPIO ") + ledPin(), false, 1);
+      btnText(8, 121, 224, 27, ledCfg.enabled ? TR("OUTPUT: ON", "ЛЕНТА: ВКЛ") : TR("OUTPUT: OFF", "ЛЕНТА: ВЫКЛ"),
+              ledCfg.enabled, 1);
+
+      for (uint8_t i = 0; i < 3; i++) {
+        int y = 158 + i * 48;
+        uint16_t start = ledSegmentStart(i);
+        uint16_t end = start + ledCfg.segmentCount[i];
+        tft.fillRoundRect(8, y, 224, 44, 6, COL_PANEL);
+        tft.setTextDatum(TL_DATUM);
+        tft.setTextColor(COL_TXT, COL_PANEL);
+        tft.setTextPadding(0);
+        String range = ledCfg.segmentCount[i]
+          ? String(start + 1) + "-" + String(end)
+          : String(TR("empty", "пусто"));
+        drawS(String(TR("SEG ", "СЕГМЕНТ ")) + String(i + 1) + ": " +
+              String(TR("LED ", "СВ ")) + range, 14, y + 2, 1);
+        btn(14, y + 20, 28, 21, "-", false, 1);
+        btnText(45, y + 20, 34, 21, String(ledCfg.segmentCount[i]), false, 1);
+        btn(82, y + 20, 28, 21, "+", false, 1);
+        uint8_t effect = ledCfg.effect[i] < LED_EFFECT_COUNT ? ledCfg.effect[i] : LED_OFF;
+        btnText(114, y + 20, 76, 21,
+                cfg.lang ? LED_EFFECT_NAMES_RU[effect] : LED_EFFECT_NAMES[effect], false, 1);
+        uint8_t colorIndex = ledCfg.color[i] % (sizeof(LED_COLORS) / sizeof(LED_COLORS[0]));
+        uint32_t rgb = LED_COLORS[colorIndex];
+        uint16_t swatch = tft.color565((rgb >> 16) & 0xFF, (rgb >> 8) & 0xFF, rgb & 0xFF);
+        tft.fillRoundRect(196, y + 20, 30, 21, 4, swatch);
+        tft.drawRoundRect(196, y + 20, 30, 21, 4, COL_TXT);
+      }
       break;
     }
     case S_PICK: {
@@ -1521,15 +1750,19 @@ void touchSettings() {
 
   switch (scr) {
     case S_SET:
-      for (int i = 0; i < 7; i++) {
-        if (!hit(x, y, 8, 34 + i * 41, 224, 36)) continue;
+      for (int i = 0; i < 8; i++) {
+        if (!hit(x, y, 8, 34 + i * 35, 224, 32)) continue;
         if (tch.evTap) {
           if (i <= 3) goScr((Scr)(S_APPEAR + i));
           else if (i == 4) { cfg.lang ^= 1; queueSave(); uiMode = -1; }      // язык переключается сразу
           else if (i == 5) { calStep = 0; calFail = false; calFromBoot = false; goScr(S_CAL); }
+          else if (i == 6) goScr(S_LED);
         }
-        if (tch.evLong && i == 6) {
+        if (tch.evLong && i == 7) {
           setDefaults(true);
+          ledCfg = LedSettings{};
+          saveLedSettings();
+          applyLedHardware();
           applyDisplayCfg();
           saveSettings();
           uiMode = -1;
@@ -1579,6 +1812,57 @@ void touchSettings() {
       if (hit(x, y, 124, 206, 108, 44)) { cfg.showDebug ^= 1; page = 0; queueSave(); uiMode = -1; }
       break;
 
+    case S_LED:
+      if (!tch.evTap) break;
+      if (hit(x, y, 8, 44, 58, 30) || hit(x, y, 174, 44, 58, 30)) {
+        int count = ledCfg.count + (x < 100 ? -1 : 1);
+        ledCfg.count = constrain(count, 1, LED_MAX_COUNT);
+        uint16_t allocated = 0;
+        for (uint8_t i = 0; i < 3; i++) allocated += ledCfg.segmentCount[i];
+        for (int i = 2; allocated > ledCfg.count && i >= 0; i--) {
+          uint8_t remove = min((uint16_t)ledCfg.segmentCount[i], (uint16_t)(allocated - ledCfg.count));
+          ledCfg.segmentCount[i] -= remove;
+          allocated -= remove;
+        }
+        applyLedHardware();
+        saveLedSettings();
+        uiMode = -1;
+      } else if (hit(x, y, 8, 88, 224, 27)) {
+        ledCfg.pinIndex = (ledCfg.pinIndex + 1) % LED_PIN_COUNT;
+        applyLedHardware();
+        saveLedSettings();
+        uiMode = -1;
+      } else if (hit(x, y, 8, 121, 224, 27)) {
+        ledCfg.enabled ^= 1;
+        if (!ledCfg.enabled) {
+          ledStrip.clear();
+          ledStrip.show();
+        }
+        saveLedSettings();
+        uiMode = -1;
+      } else {
+        for (uint8_t i = 0; i < 3; i++) {
+          int rowY = 158 + i * 48;
+          if (hit(x, y, 14, rowY + 20, 28, 21) && ledCfg.segmentCount[i] > 0) {
+            ledCfg.segmentCount[i]--;
+          } else if (hit(x, y, 82, rowY + 20, 28, 21)) {
+            uint16_t allocated = 0;
+            for (uint8_t j = 0; j < 3; j++) allocated += ledCfg.segmentCount[j];
+            if (allocated < ledCfg.count) ledCfg.segmentCount[i]++;
+          } else if (hit(x, y, 114, rowY + 20, 76, 21)) {
+            ledCfg.effect[i] = (ledCfg.effect[i] + 1) % LED_EFFECT_COUNT;
+          } else if (hit(x, y, 196, rowY + 20, 30, 21)) {
+            ledCfg.color[i] = (ledCfg.color[i] + 1) % (sizeof(LED_COLORS) / sizeof(LED_COLORS[0]));
+          } else {
+            continue;
+          }
+          saveLedSettings();
+          uiMode = -1;
+          break;
+        }
+      }
+      break;
+
     case S_PICK:
       if (!tch.evTap) break;
       for (int i = 0; i < M_COUNT; i++)
@@ -1603,6 +1887,7 @@ void handleTouch() {
 
 void housekeeping() {
   uint32_t now = millis();
+  serviceLedStrip();
   if (saveDue && (int32_t)(now - saveAt) >= 0) { saveDue = false; saveSettings(); }
   if (connected && authState == AUTH_READY && d.speed > 1.0f) markActivity();   // в движении не гасим экран
   if (cfg.dim && !dimmed && now - lastAct > (uint32_t)DIM_SEC[cfg.dim] * 1000UL) {
@@ -1708,6 +1993,7 @@ bool scanAndConnect() {
   txCounter = 0; rxCounter = 0; pressPowerRequired = false;
   authState = AUTH_WAIT_INIT; pendingTx = TX_INIT; authLastSend = millis();
   d.totalLow = 0; d.totalHigh = 0; d.tripKm = 0; sessionMax = 0;
+  speedHistoryCount = 0; speedHistoryNext = 0; brakeUntil = 0;
   memset(d.serial, 0, sizeof(d.serial)); d.fw = 0;
   status("AUTH INIT", COL_ACCENT);
   return true;
@@ -1718,6 +2004,8 @@ void setup() {
   Serial.begin(115200);
   pinMode(BTN_PIN, INPUT_PULLUP);
   loadSettings();
+  loadLedSettings();
+  applyLedHardware();
   applyTheme();
   tft.init();
   tft.setRotation(cfg.flip ? 2 : 0);   // портрет 240x320 (0 или 180°)
@@ -1738,7 +2026,7 @@ void setup() {
 }
 
 void loop() {
-  static uint32_t lastPoll = 0, lastDraw = 0;
+  static uint32_t lastPoll = 0, lastSpeedPoll = 0, lastDraw = 0;
   static int idx = 0;
   handleButton();
   handleTouch();
@@ -1759,6 +2047,11 @@ void loop() {
 
   servicePendingTx();
   serviceAuth();
+
+  if (authState == AUTH_READY && now - lastSpeedPoll >= SPEED_POLL_MS) {
+    lastSpeedPoll = now;
+    sendRead(ADDR_ESC, 0x26, 2);
+  }
 
   if (authState == AUTH_READY && now - lastPoll >= POLL_INTERVAL) {
     lastPoll = now;

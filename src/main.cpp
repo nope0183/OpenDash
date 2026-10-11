@@ -29,10 +29,9 @@
 #define ETEMP_SCALE    0.1f    // рег. 0x3E -> °C
 #define BMS_CUR_SCALE  0.01f   // А
 #define BMS_VOLT_SCALE 0.01f   // В
-#define BRAKE_DROP_KMH 8.0f
-#define BRAKE_WINDOW_MS 500
-#define BRAKE_HOLD_MS 1000
-#define SPEED_POLL_MS 200
+#define BRAKE_REGEN_CURRENT_A 1.0f
+#define BRAKE_HOLD_MS 700
+#define FAST_TELEMETRY_POLL_MS 200
 #define LED_MAX_COUNT 120
 
 static const uint8_t LED_PINS[] = {4, 16, 17, 22, 26, 27};
@@ -69,7 +68,6 @@ struct Item { uint8_t dev, reg, len; Id id; };
 
 static const Item pollList[] = {
   {ADDR_BMS, 0x32, 2, SOC},
-  {ADDR_BMS, 0x33, 2, AMP},
   {ADDR_BMS, 0x34, 2, VOLT},
   {ADDR_BMS, 0x35, 2, BTEMP},
   {ADDR_ESC, 0xB9, 2, TRIP},
@@ -111,10 +109,6 @@ TFT_eSPI tft;
 Adafruit_NeoPixel ledStrip(30, LED_PINS[3], NEO_GRB + NEO_KHZ800);
 static bool ledReady = false;
 static uint32_t brakeUntil = 0;
-static float speedHistory[4] = {};
-static uint32_t speedHistoryAt[4] = {};
-static uint8_t speedHistoryNext = 0;
-static uint8_t speedHistoryCount = 0;
 NimBLEClient* client = nullptr;
 NimBLERemoteCharacteristic *txChr = nullptr, *rxChr = nullptr;
 volatile bool connected = false;
@@ -153,20 +147,6 @@ static uint32_t lastCommand = 0;
 
 static inline uint16_t u16(const uint8_t* p) { return p[0] | (p[1] << 8); }
 static inline int16_t  s16(const uint8_t* p) { return (int16_t)u16(p); }
-static void recordSpeed(float speed) {
-  uint32_t now = millis();
-  for (uint8_t i = 0; i < speedHistoryCount; i++) {
-    if (now - speedHistoryAt[i] <= BRAKE_WINDOW_MS &&
-        speedHistory[i] - speed >= BRAKE_DROP_KMH) {
-      brakeUntil = now + BRAKE_HOLD_MS;
-      break;
-    }
-  }
-  speedHistory[speedHistoryNext] = speed;
-  speedHistoryAt[speedHistoryNext] = now;
-  speedHistoryNext = (speedHistoryNext + 1) % 4;
-  if (speedHistoryCount < 4) speedHistoryCount++;
-}
 static const uint8_t FW_DATA[16] = {
   0x97, 0xCF, 0xB8, 0x02, 0x84, 0x41, 0x43, 0xDE,
   0x56, 0x00, 0x2B, 0x3B, 0x34, 0x78, 0x0A, 0x5D
@@ -409,7 +389,15 @@ void handlePlainFrame(const uint8_t* f, size_t n) {
   if (src == ADDR_ESC && arg == 0x26 && len >= 2) {
     d.speed = fabsf(s16(p) * SPEED_SCALE);
     d.valid |= (uint16_t)(1U << SPEED);
-    recordSpeed(d.speed);
+    return;
+  }
+  if (src == ADDR_BMS && arg == 0x33 && len >= 2) {
+    d.amp = s16(p) * BMS_CUR_SCALE;
+    d.valid |= (uint16_t)(1U << AMP);
+    if ((d.valid & (1U << SPEED)) && d.speed > 3.0f &&
+        d.amp <= -BRAKE_REGEN_CURRENT_A) {
+      brakeUntil = millis() + BRAKE_HOLD_MS;
+    }
     return;
   }
   Serial.printf("RX REG dev=%02X reg=%02X len=%u data=", src, arg, len);
@@ -430,7 +418,6 @@ void handlePlainFrame(const uint8_t* f, size_t n) {
         break;
       case ETEMP: d.escTemp = s16(p) * ETEMP_SCALE; break;
       case SOC: d.soc = constrain((int)u16(p), 0, 100); break;
-      case AMP: d.amp = s16(p) * BMS_CUR_SCALE; break;
       case VOLT: d.volt = u16(p) * BMS_VOLT_SCALE; break;
       case BTEMP: d.battTemp = ((int)p[0] + (int)p[1]) / 2 - 20; break;
       case SERIAL_NO: memcpy(d.serial, p, 14); d.serial[14] = 0; break;
@@ -1993,7 +1980,7 @@ bool scanAndConnect() {
   txCounter = 0; rxCounter = 0; pressPowerRequired = false;
   authState = AUTH_WAIT_INIT; pendingTx = TX_INIT; authLastSend = millis();
   d.totalLow = 0; d.totalHigh = 0; d.tripKm = 0; sessionMax = 0;
-  speedHistoryCount = 0; speedHistoryNext = 0; brakeUntil = 0;
+  brakeUntil = 0;
   memset(d.serial, 0, sizeof(d.serial)); d.fw = 0;
   status("AUTH INIT", COL_ACCENT);
   return true;
@@ -2026,8 +2013,9 @@ void setup() {
 }
 
 void loop() {
-  static uint32_t lastPoll = 0, lastSpeedPoll = 0, lastDraw = 0;
+  static uint32_t lastPoll = 0, lastFastPoll = 0, lastDraw = 0;
   static int idx = 0;
+  static bool pollBrakeCurrent = false;
   handleButton();
   handleTouch();
   housekeeping();
@@ -2048,9 +2036,11 @@ void loop() {
   servicePendingTx();
   serviceAuth();
 
-  if (authState == AUTH_READY && now - lastSpeedPoll >= SPEED_POLL_MS) {
-    lastSpeedPoll = now;
-    sendRead(ADDR_ESC, 0x26, 2);
+  if (authState == AUTH_READY && now - lastFastPoll >= FAST_TELEMETRY_POLL_MS) {
+    lastFastPoll = now;
+    if (pollBrakeCurrent) sendRead(ADDR_BMS, 0x33, 2);
+    else sendRead(ADDR_ESC, 0x26, 2);
+    pollBrakeCurrent = !pollBrakeCurrent;
   }
 
   if (authState == AUTH_READY && now - lastPoll >= POLL_INTERVAL) {

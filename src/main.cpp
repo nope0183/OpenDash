@@ -11,6 +11,10 @@
 #include <cstring>
 #include <SPI.h>
 #include <Preferences.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Update.h>
+#include <esp_system.h>
 #include <XPT2046_Touchscreen.h>
 #include <Adafruit_NeoPixel.h>
 #include "ru_fonts.h"   // кириллица для TFT_eSPI (генерируется tools/gen_ru_font.py)
@@ -568,6 +572,8 @@ struct Settings {
   Cal cal;
 };
 static Settings cfg;
+static bool otaEnabled = false;
+static bool otaSettingsError = false;
 
 struct Theme { const char* name; const char* nameRu; uint16_t bg, panel, track, txt, dim, good, warn, bad; };
 static const Theme THEMES[4] = {
@@ -666,6 +672,7 @@ void setDefaults(bool keepCal) {
 }
 
 static Preferences prefs;
+static Preferences otaPrefs;
 static Preferences ledPrefs;
 static bool saveDue = false;
 static uint32_t saveAt = 0;
@@ -680,6 +687,152 @@ void loadSettings() {
   }
   prefs.end();
 }
+
+void loadOtaSetting() {
+  if (!otaPrefs.begin("opendash", true)) {
+    otaSettingsError = true;
+    Serial.println("ERROR: cannot open OTA settings");
+    return;
+  }
+  otaEnabled = otaPrefs.getBool("otaEnabled", false);
+  otaPrefs.end();
+}
+
+bool saveOtaSetting() {
+  if (!otaPrefs.begin("opendash", false)) {
+    Serial.println("ERROR: cannot open OTA settings for saving");
+    otaSettingsError = true;
+    return false;
+  }
+  size_t saved = otaPrefs.putBool("otaEnabled", otaEnabled);
+  otaPrefs.end();
+  otaSettingsError = saved == 0;
+  if (otaSettingsError) Serial.println("ERROR: failed to save OTA setting");
+  return !otaSettingsError;
+}
+
+static WebServer otaServer(80);
+static char otaSsid[24];
+static char otaPassword[13];
+static bool otaApReady = false;
+static bool otaUploadStarted = false;
+static bool otaUploadFailed = false;
+static bool otaUploadComplete = false;
+static uint32_t otaRebootAt = 0;
+
+void handleOtaUpload() {
+  HTTPUpload& upload = otaServer.upload();
+  if (upload.status == UPLOAD_FILE_START) {
+    otaUploadStarted = false;
+    otaUploadFailed = false;
+    otaUploadComplete = false;
+    String filename = upload.filename;
+    filename.toLowerCase();
+    if (!filename.endsWith(".bin")) {
+      otaUploadFailed = true;
+      Serial.println("ERROR: OTA upload must be a .bin file");
+      return;
+    }
+    if (!Update.begin(UPDATE_SIZE_UNKNOWN, U_FLASH)) {
+      otaUploadFailed = true;
+      Update.printError(Serial);
+      return;
+    }
+    otaUploadStarted = true;
+    Serial.printf("OTA upload started: %s\n", upload.filename.c_str());
+  } else if (upload.status == UPLOAD_FILE_WRITE) {
+    if (otaUploadStarted && !otaUploadFailed &&
+        Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
+      otaUploadFailed = true;
+      Update.printError(Serial);
+    }
+  } else if (upload.status == UPLOAD_FILE_END) {
+    if (otaUploadStarted && !otaUploadFailed) {
+      otaUploadComplete = Update.end(true);
+      if (!otaUploadComplete) {
+        otaUploadFailed = true;
+        Update.printError(Serial);
+      } else {
+        Serial.printf("OTA upload complete: %u bytes\n", upload.totalSize);
+      }
+    }
+  } else if (upload.status == UPLOAD_FILE_ABORTED) {
+    otaUploadFailed = true;
+    if (otaUploadStarted) Update.abort();
+    Serial.println("ERROR: OTA upload aborted");
+  }
+}
+
+void startOtaAccessPoint() {
+  uint64_t mac = ESP.getEfuseMac();
+  snprintf(otaSsid, sizeof(otaSsid), "OpenDash-%06llX", mac & 0xFFFFFFULL);
+  const char hex[] = "0123456789ABCDEF";
+  uint32_t randomBits[2] = {esp_random(), esp_random()};
+  for (size_t i = 0; i < 12; i++)
+    otaPassword[i] = hex[(randomBits[i / 8] >> ((i % 8) * 4)) & 0x0F];
+  otaPassword[12] = '\0';
+
+  WiFi.mode(WIFI_AP);
+  otaApReady = WiFi.softAP(otaSsid, otaPassword);
+  if (!otaApReady) {
+    Serial.println("ERROR: failed to start OTA Wi-Fi access point");
+    return;
+  }
+
+  otaServer.on("/", HTTP_GET, []() {
+    otaServer.sendHeader("Cache-Control", "no-store");
+    otaServer.send(200, "text/html; charset=utf-8",
+      "<!doctype html><html lang='ru'><meta name='viewport' content='width=device-width'>"
+      "<title>OpenDash OTA</title><style>body{font:16px system-ui;max-width:38em;margin:3em auto;padding:0 1em}"
+      "button,input{font:inherit;margin:.5em 0}progress{width:100%}</style>"
+      "<h1>OpenDash — обновление</h1><p>Выберите файл прошивки .bin для этой платы. "
+      "Не отключайте питание во время загрузки.</p><form id='f'><input id='b' type='file' accept='.bin' required>"
+      "<button>Загрузить и установить</button></form><progress id='p' max='100' value='0' hidden></progress>"
+      "<p id='s'></p><script>f.onsubmit=async e=>{e.preventDefault();if(!b.files.length)return;"
+      "p.hidden=false;s.textContent='Загрузка…';let x=new XMLHttpRequest();x.open('POST','/update');"
+      "x.upload.onprogress=e=>{if(e.lengthComputable)p.value=e.loaded/e.total*100};"
+      "x.onload=()=>s.textContent=x.status===200?x.responseText:'Ошибка: '+x.responseText;"
+      "x.onerror=()=>s.textContent='Ошибка соединения';let d=new FormData();d.append('firmware',b.files[0]);x.send(d)};"
+      "</script></html>");
+  });
+  otaServer.on("/update", HTTP_POST, []() {
+    if (!otaUploadStarted || otaUploadFailed || !otaUploadComplete) {
+      otaServer.send(400, "text/plain; charset=utf-8", "Ошибка записи прошивки. См. журнал Serial.");
+      return;
+    }
+    otaServer.send(200, "text/plain; charset=utf-8", "Прошивка установлена. Устройство перезагрузится.");
+    otaRebootAt = millis() + 1200;
+  }, handleOtaUpload);
+  otaServer.onNotFound([]() { otaServer.send(404, "text/plain", "Not found"); });
+  otaServer.begin();
+  Serial.printf("OTA access point: %s, password: %s, address: %s\n",
+                otaSsid, otaPassword, WiFi.softAPIP().toString().c_str());
+}
+
+void stopOtaAccessPoint() {
+  otaServer.stop();
+  WiFi.softAPdisconnect(true);
+  WiFi.mode(WIFI_OFF);
+  otaApReady = false;
+  otaRebootAt = 0;
+}
+
+void serviceOtaWeb() {
+  if (otaEnabled && otaApReady) otaServer.handleClient();
+  if (otaRebootAt && (int32_t)(millis() - otaRebootAt) >= 0) ESP.restart();
+}
+
+void setOtaEnabled(bool enabled) {
+  bool previous = otaEnabled;
+  otaEnabled = enabled;
+  if (!saveOtaSetting()) {
+    otaEnabled = previous;
+    return;
+  }
+  if (otaEnabled) startOtaAccessPoint();
+  else stopOtaAccessPoint();
+}
+
 void saveSettings() {
   if (!prefs.begin("opendash", false)) return;
   prefs.putBytes("cfg", &cfg, sizeof(cfg));
@@ -796,7 +949,7 @@ void nextPage(int dir) {
 }
 
 // ---------- Экраны ----------
-enum Scr : uint8_t { S_MAIN, S_SET, S_APPEAR, S_DISPLAY, S_GAUGE, S_WIDGETS, S_LED, S_PICK, S_CAL };
+enum Scr : uint8_t { S_MAIN, S_SET, S_APPEAR, S_DISPLAY, S_GAUGE, S_WIDGETS, S_LED, S_OTA, S_PICK, S_CAL };
 static Scr scr = S_MAIN;
 static Scr pickReturn = S_WIDGETS;
 static uint8_t pickSlot = 0;
@@ -1384,16 +1537,16 @@ void drawSettingsScreen() {
   switch (scr) {
     case S_SET: {
       settingsHeader(TR("SETTINGS", "Настройки"));
-      const char* titles[8] = {TR("APPEARANCE", "Внешний вид"), TR("DISPLAY", "Экран"), TR("GAUGE & UNITS", "Шкала и единицы"),
+      const char* titles[9] = {TR("APPEARANCE", "Внешний вид"), TR("DISPLAY", "Экран"), TR("GAUGE & UNITS", "Шкала и единицы"),
                                TR("WIDGETS & PAGES", "Виджеты и страницы"), TR("LANGUAGE", "Язык"),
                                TR("TOUCH CALIBRATION", "Калибровка тача"), TR("ARGB LED STRIP", "ARGB-лента"),
-                               TR("RESET TO DEFAULTS", "Сброс настроек")};
+                               TR("OTA UPDATE", "Обновление OTA"), TR("RESET TO DEFAULTS", "Сброс настроек")};
       char dm[10];
       if (cfg.dim) snprintf(dm, sizeof(dm), TR("%ds", "%d с"), DIM_SEC[cfg.dim]); else strcpy(dm, TR("off", "выкл"));
       const char* tn = cfg.lang ? THEMES[cfg.theme].nameRu : THEMES[cfg.theme].name;
       const char* an = cfg.accent < 8 ? (cfg.lang ? ACCENT_NAME_RU[cfg.accent] : ACCENT_NAME[cfg.accent]) : TR("custom", "свой");
       const char* sn = cfg.lang ? STYLE_NAME_RU[cfg.style] : STYLE_NAME[cfg.style];
-      char sub[8][56];
+      char sub[9][56];
       snprintf(sub[0], 56, TR("%s theme, %s accent", "%s, акцент: %s"), tn, an);
       snprintf(sub[1], 56, TR("brightness %d%%, auto-dim %s", "яркость %d%%, затемнение: %s"), cfg.bright, dm);
       snprintf(sub[2], 56, TR("%s, max %d, %s gauge", "%s, макс. %d, шкала: %s"), uSpd(), gmax(), sn);
@@ -1403,18 +1556,20 @@ void drawSettingsScreen() {
       snprintf(sub[5], 56, "%s", TR("re-map the touch panel (3 taps)", "откалибровать сенсор (3 касания)"));
       snprintf(sub[6], 56, TR("%d LEDs, GPIO %d, %s", "%d светодиодов, GPIO %d, %s"),
                (int)ledCfg.count, (int)ledPin(), ledCfg.enabled ? TR("on", "вкл") : TR("off", "выкл"));
-      snprintf(sub[7], 56, "%s", TR("press and HOLD to restore defaults", "удерживайте для сброса"));
-      for (int i = 0; i < 8; i++) {
-        int y = 34 + i * 35;
-        tft.fillRoundRect(8, y, 224, 32, 6, COL_PANEL);
-        tft.fillRect(8, y + 5, 3, 22, i == 7 ? COL_BAD : COL_ACCENT);
+      snprintf(sub[7], 56, TR("web access %s", "веб-доступ: %s"),
+               otaEnabled ? TR("on", "вкл") : TR("off", "выкл"));
+      snprintf(sub[8], 56, "%s", TR("press and HOLD to restore defaults", "удерживайте для сброса"));
+      for (int i = 0; i < 9; i++) {
+        int y = 32 + i * 31;
+        tft.fillRoundRect(8, y, 224, 29, 6, COL_PANEL);
+        tft.fillRect(8, y + 4, 3, 21, i == 8 ? COL_BAD : COL_ACCENT);
         tft.setTextDatum(TL_DATUM);
         tft.setTextPadding(0);
-        tft.setTextColor(i == 7 ? COL_BAD : COL_TXT, COL_PANEL);
-        drawS(titles[i], 20, y + 1, 2);
+        tft.setTextColor(i == 8 ? COL_BAD : COL_TXT, COL_PANEL);
+        drawS(titles[i], 20, y, 2);
         tft.setTextColor(COL_DIM, COL_PANEL);
-        drawS(sub[i], 20, y + 19, 1);
-        if (i != 4) {
+        drawS(sub[i], 20, y + 16, 1);
+        if (i != 4 && i != 8) {
           tft.drawLine(216, y + 10, 222, y + 16, COL_DIM);
           tft.drawLine(222, y + 16, 216, y + 22, COL_DIM);
         }
@@ -1553,6 +1708,28 @@ void drawSettingsScreen() {
         tft.fillRoundRect(196, y + 20, 30, 21, 4, swatch);
         tft.drawRoundRect(196, y + 20, 30, 21, 4, COL_TXT);
       }
+      break;
+    }
+    case S_OTA: {
+      settingsHeader(TR("WEB FIRMWARE UPDATE", "Обновление по Wi-Fi"));
+      secLabel(8, 40, TR("WEB UPDATE ACCESS", "ДОСТУП К ОБНОВЛЕНИЮ"));
+      btnText(8, 54, 224, 44,
+              otaEnabled ? TR("OTA ACCESS: ON", "OTA-ДОСТУП: ВКЛ") : TR("OTA ACCESS: OFF", "OTA-ДОСТУП: ВЫКЛ"),
+              otaEnabled, 2);
+      if (otaEnabled && otaApReady) {
+        secLabel(8, 116, TR("CONNECT TO WI-FI", "ПОДКЛЮЧИТЕСЬ К WI-FI"));
+        drawS(String("SSID: ") + otaSsid, 8, 136, 1);
+        drawS(String(TR("PASSWORD: ", "ПАРОЛЬ: ")) + otaPassword, 8, 156, 1);
+        drawS(String("URL: http://") + WiFi.softAPIP().toString(), 8, 176, 1);
+        secLabel(8, 216, TR("Open the URL and upload a .bin file.", "Откройте адрес и загрузите файл .bin."));
+        secLabel(8, 232, TR("Keep power connected during update.", "Не отключайте питание во время обновления."));
+      } else if (otaEnabled) {
+        drawS(TR("Wi-Fi access point failed to start.", "Не удалось запустить точку доступа Wi-Fi."), 8, 124, 1);
+      } else {
+        drawS(TR("Enable access only while updating.", "Включайте доступ только при обновлении."), 8, 124, 1);
+      }
+      if (otaSettingsError)
+        drawS(TR("ERROR: setting could not be saved.", "ОШИБКА: настройка не сохранена."), 8, 268, 1);
       break;
     }
     case S_PICK: {
@@ -1737,15 +1914,16 @@ void touchSettings() {
 
   switch (scr) {
     case S_SET:
-      for (int i = 0; i < 8; i++) {
-        if (!hit(x, y, 8, 34 + i * 35, 224, 32)) continue;
+      for (int i = 0; i < 9; i++) {
+        if (!hit(x, y, 8, 32 + i * 31, 224, 29)) continue;
         if (tch.evTap) {
           if (i <= 3) goScr((Scr)(S_APPEAR + i));
           else if (i == 4) { cfg.lang ^= 1; queueSave(); uiMode = -1; }      // язык переключается сразу
           else if (i == 5) { calStep = 0; calFail = false; calFromBoot = false; goScr(S_CAL); }
           else if (i == 6) goScr(S_LED);
+          else if (i == 7) goScr(S_OTA);
         }
-        if (tch.evLong && i == 7) {
+        if (tch.evLong && i == 8) {
           setDefaults(true);
           ledCfg = LedSettings{};
           saveLedSettings();
@@ -1850,6 +2028,13 @@ void touchSettings() {
       }
       break;
 
+    case S_OTA:
+      if (tch.evTap && hit(x, y, 8, 54, 224, 44)) {
+        setOtaEnabled(!otaEnabled);
+        uiMode = -1;
+      }
+      break;
+
     case S_PICK:
       if (!tch.evTap) break;
       for (int i = 0; i < M_COUNT; i++)
@@ -1905,6 +2090,7 @@ void uiTick() {
   static uint32_t lastDraw = 0;
   handleButton();
   handleTouch();
+  serviceOtaWeb();
   housekeeping();
   uint32_t now = millis();
   if (now - lastDraw >= 90) { lastDraw = now; drawUi(); }
@@ -1991,6 +2177,7 @@ void setup() {
   Serial.begin(115200);
   pinMode(BTN_PIN, INPUT_PULLUP);
   loadSettings();
+  loadOtaSetting();
   loadLedSettings();
   applyLedHardware();
   applyTheme();
@@ -2007,6 +2194,7 @@ void setup() {
   clearCache();
   lastAct = millis();
   drawUi();
+  if (otaEnabled) startOtaAccessPoint();
   NimBLEDevice::init("");
   NimBLEDevice::setPower(ESP_PWR_LVL_P9);
   Serial.println("Ninebot G30/ES4 dashboard; encrypted handshake required");
@@ -2018,6 +2206,7 @@ void loop() {
   static bool pollBrakeCurrent = false;
   handleButton();
   handleTouch();
+  serviceOtaWeb();
   housekeeping();
 
   if (!connected) {

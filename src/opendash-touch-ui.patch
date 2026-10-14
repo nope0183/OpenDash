@@ -1,0 +1,5055 @@
+diff --git a/README.md b/README.md
+index 4a76894..04b9328 100644
+--- a/README.md
++++ b/README.md
+@@ -12,6 +12,7 @@ OpenDash подключается к самокату по Bluetooth Low Energy,
+ - Пробег поездки и общий пробег.
+ - Температура контроллера и батареи, версия прошивки и серийный номер.
+ - Отдельные страницы панели, подробной информации и отладки.
++- Сенсорное управление и настройка интерфейса на экране: темы, цвета, яркость, виджеты, единицы.
+ - Защищённое BLE-рукопожатие Ninebot с подтверждением кнопкой питания самоката.
+ - Только чтение телеметрии: OpenDash не отправляет команды управления и не изменяет настройки самоката.
+ 
+@@ -92,21 +93,49 @@ pio device monitor -b 115200
+ 
+ ## Управление
+ 
+-На CYD используйте кнопку **BOOT**:
++### Сенсорный экран
+ 
+-- короткое нажатие — следующая страница;
++| Жест | Действие |
++| --- | --- |
++| Свайп влево / вправо | Следующая / предыдущая страница |
++| Касание шестерёнки (справа в шапке) | Открыть настройки |
++| Касание точек страниц в шапке | Следующая страница |
++| Касание карточки на панели | Следующие данные в этой карточке |
++| Удержание карточки (~0,65 с) | Выбрать данные из списка |
++| Касание спидометра | Переключить км/ч ↔ mph |
++
++**Блокировка в движении.** Пока скорость выше 3 км/ч, все касания, кроме свайпа страниц, игнорируются (можно отключить в *Настройки → Экран*).
++
++### Кнопка BOOT
++
++- короткое нажатие — следующая страница (в настройках — «назад»);
+ - удерживание более 1,5 секунды — переподключение к самокату.
+ 
++### Первый запуск: калибровка тача
++
++При первом включении откроется калибровка: коснитесь трёх меток по очереди (лучше стилусом). Оси и инверсия определяются автоматически, поэтому работает с любой ревизией CYD. Перекалибровать можно в *Настройки → Калибровка тача*.
++
+ Страницы: панель со спидометром, информация об устройстве и отладочные данные BLE.
+ 
+-## Настройки
++## Настройки на экране
++
++Все параметры меняются прямо на дисплее и сохраняются в памяти ESP32 (NVS), поэтому остаются после перезагрузки.
++
++- **Внешний вид:** 4 темы (NAVY, BLACK, SLATE, LIGHT для солнца), 8 цветов акцента и произвольный оттенок ползунком.
++- **Экран:** яркость (плавно, ШИМ подсветки), автозатемнение при бездействии (не срабатывает в движении), поворот на 180°, блокировка в движении.
++- **Спидометр и единицы:** км/ч или mph, максимум шкалы отдельно для каждой единицы, стиль цвета шкалы (плавный градиент, один цвет, зоны).
++- **Виджеты и страницы:** четыре карточки на панели, каждая показывает любое из: заряд, мощность, поездка, температуры, общий пробег, напряжение, ток, максимальная скорость за поездку; страницы «Информация» и «Отладка» можно скрыть.
++- **Язык:** English / Русский, переключается одним касанием в *Настройки → Язык*. Переводится весь интерфейс, кроме страницы отладки BLE.
++- **Сброс:** удерживайте строку *Reset to defaults* (калибровка тача сохраняется).
++
++## Параметры в коде
+ 
+-Основные параметры находятся в начале `src/main.cpp`:
++Дополнительные параметры находятся в начале `src/main.cpp`:
+ 
+ | Параметр | Назначение |
+ | --- | --- |
+ | `TARGET_NAME` | Имя самоката для точного выбора; пустая строка включает автоматический поиск |
+-| `GAUGE_MAX` | Максимум шкалы спидометра, км/ч |
++| `GAUGE_MAX` | Шкала спидометра по умолчанию, км/ч (дальше меняется в настройках на экране) |
+ | `POLL_INTERVAL` | Интервал между запросами телеметрии |
+ | `LINK_TIMEOUT` | Тайм-аут потери связи |
+ | `SPEED_SCALE`, `TRIP_SCALE`, `TOTAL_SCALE` | Масштабы скорости и пробега |
+@@ -129,7 +158,10 @@ OpenDash/
+ ├── platformio.ini       # платформы, библиотеки и конфигурации дисплея
+ ├── src/
+ │   ├── main.cpp         # прошивка OpenDash
++│   ├── ru_fonts.h       # растровые шрифты с кириллицей (генерируется)
+ │   └── probe_auth.cpp   # отдельный экспериментальный BLE-инструмент
++├── tools/
++│   └── gen_ru_font.py   # генератор ru_fonts.h из DejaVu Sans Condensed (нужен Pillow)
+ └── .vscode/
+     └── extensions.json # рекомендация расширения PlatformIO IDE
+ ```
+diff --git a/platformio.ini b/platformio.ini
+index d61d9b1..edf5bf0 100644
+--- a/platformio.ini
++++ b/platformio.ini
+@@ -11,6 +11,7 @@ parts = huge_app.csv
+ lib_deps =
+     bodmer/TFT_eSPI@^2.5.43
+     h2zero/NimBLE-Arduino@~1.4.2
++    https://github.com/PaulStoffregen/XPT2046_Touchscreen.git
+ common_flags =
+     -DUSER_SETUP_LOADED=1
+     -DTFT_WIDTH=240
+@@ -30,6 +31,7 @@ common_flags =
+     -DLOAD_FONT4=1
+     -DLOAD_FONT6=1
+     -DLOAD_FONT7=1
++    -DLOAD_GFXFF=1
+ 
+ [env:cyd_2usb]
+ platform = ${common.platform}
+diff --git a/src/main.cpp b/src/main.cpp
+index 41bb34f..a1a87c3 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -1,5 +1,6 @@
+ // OpenDash-аналог для CYD: Ninebot G30 / ES4, BLE, только чтение телеметрии.
+-// Кнопка BOOT (GPIO0): короткое нажатие - следующая страница, долгое (>1.5 c) - переподключение.
++// Управление: сенсорный экран (свайп - страницы, шестерёнка - настройки) и кнопка BOOT (GPIO0):
++// короткое нажатие - следующая страница / назад, долгое (>1.5 c) - переподключение.
+ // Страницы: 0 - панель со спидометром, 1 - информация, 2 - отладка.
+ 
+ #include <Arduino.h>
+@@ -8,13 +9,17 @@
+ #include <mbedtls/aes.h>
+ #include <mbedtls/sha1.h>
+ #include <cstring>
++#include <SPI.h>
++#include <Preferences.h>
++#include <XPT2046_Touchscreen.h>
++#include "ru_fonts.h"   // кириллица для TFT_eSPI (генерируется tools/gen_ru_font.py)
+ 
+ // ---------- Настройки ----------
+ #define BTN_PIN        0
+ #define TARGET_NAME    ""      // "" = первый найденный Ninebot; иначе точное имя, напр. "NBScooter1234"
+ #define POLL_INTERVAL  400     // мс между запросами; один зашифрованный запрос за раз
+ #define LINK_TIMEOUT   6000    // мс без ответов = считаем связь потерянной
+-#define GAUGE_MAX      30      // максимум шкалы спидометра, км/ч (делится на 3)
++#define GAUGE_MAX      30      // шкала спидометра по умолчанию, км/ч (дальше меняется в настройках на экране)
+ 
+ // Масштабы регистров. Если на странице отладки значения не сходятся - правь здесь.
+ #define SPEED_SCALE    0.1f    // рег. 0x26 -> км/ч
+@@ -24,19 +29,19 @@
+ #define BMS_CUR_SCALE  0.01f   // А
+ #define BMS_VOLT_SCALE 0.01f   // В
+ 
+-// ---------- Палитра ----------
++// ---------- Палитра (меняется темой из настроек, см. applyTheme) ----------
+ constexpr uint16_t C565(uint8_t r, uint8_t g, uint8_t b) {
+   return ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
+ }
+-constexpr uint16_t COL_BG     = C565(8, 10, 18);
+-constexpr uint16_t COL_PANEL  = C565(20, 26, 42);
+-constexpr uint16_t COL_TRACK  = C565(36, 44, 64);
+-constexpr uint16_t COL_ACCENT = C565(0, 200, 255);
+-constexpr uint16_t COL_TXT    = C565(240, 244, 252);
+-constexpr uint16_t COL_DIM    = C565(125, 138, 165);
+-constexpr uint16_t COL_GOOD   = C565(60, 225, 120);
+-constexpr uint16_t COL_WARN   = C565(255, 190, 40);
+-constexpr uint16_t COL_BAD    = C565(255, 70, 70);
++uint16_t COL_BG     = C565(8, 10, 18);
++uint16_t COL_PANEL  = C565(20, 26, 42);
++uint16_t COL_TRACK  = C565(36, 44, 64);
++uint16_t COL_ACCENT = C565(0, 200, 255);
++uint16_t COL_TXT    = C565(240, 244, 252);
++uint16_t COL_DIM    = C565(125, 138, 165);
++uint16_t COL_GOOD   = C565(60, 225, 120);
++uint16_t COL_WARN   = C565(255, 190, 40);
++uint16_t COL_BAD    = C565(255, 70, 70);
+ 
+ void status(const String& s, uint16_t col = COL_WARN);
+ 
+@@ -505,6 +510,253 @@ void servicePendingTx() {
+   else if (pending == TX_PAIR) sendPair();
+ }
+ 
++// =====================================================================
++//                 ПОЛЬЗОВАТЕЛЬСКИЕ НАСТРОЙКИ (хранятся в NVS)
++// =====================================================================
++#define SET_VER 1
++
++enum Metric : uint8_t { M_BATT, M_POWER, M_TRIP, M_TEMP, M_ODO, M_VOLT, M_CURR, M_MAXSPD, M_COUNT };
++static const char* const METRIC_NAME[M_COUNT] = {
++  "BATTERY", "POWER", "TRIP", "ESC / BAT", "ODOMETER", "VOLTAGE", "CURRENT", "TOP SPEED"
++};
++
++struct Cal { float x0, xk, y0, yk; uint8_t swap, flip, valid, pad; };
++struct Settings {
++  uint8_t ver, theme, accent, style, units, bright, dim, flip, lock, showInfo, showDebug, gmaxKmh, gmaxMph;
++  uint8_t card[4];
++  uint8_t lang;        // 0 - English, 1 - Русский
++  uint16_t hue;
++  Cal cal;
++};
++static Settings cfg;
++
++struct Theme { const char* name; const char* nameRu; uint16_t bg, panel, track, txt, dim, good, warn, bad; };
++static const Theme THEMES[4] = {
++  {"NAVY", "Синяя", C565(8, 10, 18), C565(20, 26, 42), C565(36, 44, 64),  C565(240, 244, 252), C565(125, 138, 165), C565(60, 225, 120), C565(255, 190, 40), C565(255, 70, 70)},
++  {"BLACK", "Чёрная", C565(0, 0, 0),   C565(18, 18, 22), C565(44, 44, 52),  C565(245, 245, 250), C565(130, 135, 150), C565(60, 225, 120), C565(255, 190, 40), C565(255, 70, 70)},
++  {"SLATE", "Серая", C565(30, 34, 40), C565(46, 52, 60), C565(74, 82, 94), C565(236, 240, 246), C565(150, 160, 176), C565(60, 225, 120), C565(255, 190, 40), C565(255, 80, 80)},
++  {"LIGHT", "Светлая", C565(232, 236, 244), C565(255, 255, 255), C565(205, 212, 226), C565(16, 20, 32), C565(92, 104, 126), C565(0, 150, 70), C565(225, 140, 0), C565(215, 40, 40)},
++};
++static const uint16_t ACCENTS[8] = {
++  C565(0, 200, 255), C565(70, 120, 255), C565(170, 90, 255), C565(255, 80, 170),
++  C565(255, 70, 70), C565(255, 140, 30), C565(255, 210, 40), C565(60, 225, 120)
++};
++static const char* const ACCENT_NAME[8] = {"cyan", "blue", "purple", "pink", "red", "orange", "yellow", "green"};
++static const char* const STYLE_NAME[3] = {"fade", "solid", "zones"};
++static const uint8_t DIM_SEC[4] = {0, 15, 30, 60};
++
++// ---------- Язык и кириллица ----------
++#define TR(en, ru) (cfg.lang ? (ru) : (en))
++static const char* const ACCENT_NAME_RU[8] = {"голубой", "синий", "сиреневый", "розовый", "красный", "оранжевый", "жёлтый", "зелёный"};
++static const char* const STYLE_NAME_RU[3] = {"плавная", "один цвет", "зоны"};
++static const char* const METRIC_NAME_RU[M_COUNT] = {"Батарея", "Мощность", "Поездка", "Темп. ESC/АКБ", "Одометр", "Напряжение", "Ток", "Макс. скорость"};
++static inline const char* metricName(int m) { m %= M_COUNT; return cfg.lang ? METRIC_NAME_RU[m] : METRIC_NAME[m]; }
++
++static bool nonAscii(const char* s) { while (*s) if ((uint8_t)*s++ >= 0x80) return true; return false; }
++static const GFXfont* ruFont(int font) { return font == 4 ? &RU4 : font == 2 ? &RU2 : &RU1; }
++
++// Рисует строку: текст с кириллицей - растровым шрифтом RU1/RU2/RU4 (по размеру встроенного шрифта 1/2/4),
++// всё остальное (цифры, латиница) - как раньше встроенными шрифтами TFT_eSPI.
++int drawS(const String& s, int x, int y, int font) {
++  if ((font == 1 || font == 2 || font == 4) && nonAscii(s.c_str())) {
++    tft.setFreeFont(ruFont(font));
++    int r = tft.drawString(s, x, y, 1);
++    tft.setFreeFont(nullptr);
++    return r;
++  }
++  return tft.drawString(s, x, y, font);
++}
++int textW(const String& s, int font) {
++  if ((font == 1 || font == 2 || font == 4) && nonAscii(s.c_str())) {
++    tft.setFreeFont(ruFont(font));
++    int w = tft.textWidth(s, 1);
++    tft.setFreeFont(nullptr);
++    return w;
++  }
++  return tft.textWidth(s, font);
++}
++
++// Статусные строки задаются в коде по-английски; перевод подставляется при отрисовке.
++String statusText(const char* s) {
++  if (!cfg.lang) return String(s);
++  static const char* const M[][2] = {
++    {"AUTH INIT", "Авторизация"}, {"PRESS POWER", "Нажмите кнопку"}, {"PAIRING", "Сопряжение"},
++    {"NO LINK", "Нет связи"}, {"scan...", "Поиск..."}, {"not found", "Не найден"},
++    {"conn fail", "Сбой подключения"}, {"no NUS", "Нет NUS"}, {"chr fail", "Ошибка BLE"},
++    {"link lost", "Связь потеряна"}, {"READY", "Готово"}};
++  for (auto& m : M) if (!strcmp(s, m[0])) return String(m[1]);
++  if (!strncmp(s, "LIVE ", 5)) return String("На связи ") + (s + 5);
++  if (!strncmp(s, "connect ", 8)) return String("Подключение ") + (s + 8);
++  return String(s);
++}
++
++uint16_t hue565(int h) {
++  h = ((h % 360) + 360) % 360;
++  int f = (h % 60) * 255 / 60, r, g, b;
++  switch (h / 60) {
++    case 0: r = 255; g = f; b = 0; break;
++    case 1: r = 255 - f; g = 255; b = 0; break;
++    case 2: r = 0; g = 255; b = f; break;
++    case 3: r = 0; g = 255 - f; b = 255; break;
++    case 4: r = f; g = 0; b = 255; break;
++    default: r = 255; g = 0; b = 255 - f; break;
++  }
++  return C565(r, g, b);
++}
++
++void applyTheme() {
++  const Theme& t = THEMES[cfg.theme < 4 ? cfg.theme : 0];
++  COL_BG = t.bg; COL_PANEL = t.panel; COL_TRACK = t.track; COL_TXT = t.txt; COL_DIM = t.dim;
++  COL_GOOD = t.good; COL_WARN = t.warn; COL_BAD = t.bad;
++  COL_ACCENT = cfg.accent < 8 ? ACCENTS[cfg.accent] : hue565(cfg.hue);
++}
++
++void setDefaults(bool keepCal) {
++  Cal c = cfg.cal;
++  memset(&cfg, 0, sizeof(cfg));
++  cfg.ver = SET_VER;
++  cfg.hue = 200;
++  cfg.bright = 100;
++  cfg.lock = 1;
++  cfg.showInfo = 1;
++  cfg.showDebug = 1;
++  cfg.gmaxKmh = GAUGE_MAX;
++  cfg.gmaxMph = 18;
++  cfg.card[0] = M_BATT; cfg.card[1] = M_POWER; cfg.card[2] = M_TRIP; cfg.card[3] = M_TEMP;
++  if (keepCal) cfg.cal = c;
++}
++
++static Preferences prefs;
++static bool saveDue = false;
++static uint32_t saveAt = 0;
++
++void loadSettings() {
++  setDefaults(false);
++  if (!prefs.begin("opendash", false)) return;
++  if (prefs.getBytesLength("cfg") == sizeof(Settings)) {
++    Settings t;
++    prefs.getBytes("cfg", &t, sizeof(t));
++    if (t.ver == SET_VER && t.theme < 4 && t.accent <= 8 && t.style < 3 && t.dim < 4 && t.lang < 2) cfg = t;
++  }
++  prefs.end();
++}
++void saveSettings() {
++  if (!prefs.begin("opendash", false)) return;
++  prefs.putBytes("cfg", &cfg, sizeof(cfg));
++  prefs.end();
++}
++void queueSave() { saveDue = true; saveAt = millis() + 1200; }
++
++// Единицы измерения (внутри всё хранится в км/ч и км)
++static inline float kmU(float km) { return cfg.units ? km * 0.621371f : km; }
++static inline const char* uSpd() { return cfg.units ? TR("mph", "миль/ч") : TR("km/h", "км/ч"); }
++static inline const char* uDst() { return cfg.units ? TR("mi", "миль") : TR("km", "км"); }
++static inline int gmax() { return cfg.units ? cfg.gmaxMph : cfg.gmaxKmh; }
++static inline bool pageOn(int p) { return p == 0 || (p == 1 && cfg.showInfo) || (p == 2 && cfg.showDebug); }
++void nextPage(int dir) {
++  int n = page;
++  for (int i = 0; i < 3; i++) { n = (n + dir + 3) % 3; if (pageOn(n)) { page = n; return; } }
++}
++
++// ---------- Экраны ----------
++enum Scr : uint8_t { S_MAIN, S_SET, S_APPEAR, S_DISPLAY, S_GAUGE, S_WIDGETS, S_PICK, S_CAL };
++static Scr scr = S_MAIN;
++static Scr pickReturn = S_WIDGETS;
++static uint8_t pickSlot = 0;
++static uint8_t calStep = 0;
++static bool calFromBoot = false, calFail = false;
++static float calRaw[3][2];
++static int uiMode = -1;
++static float sessionMax = 0;
++
++// ---------- Подсветка ----------
++#define BL_PIN 21
++#define BL_CH  0
++static bool dimmed = false;
++static uint32_t lastAct = 0;
++
++void setBacklight(int pct) { pct = constrain(pct, 5, 100); ledcWrite(BL_CH, (255 * pct) / 100); }
++void markActivity() { lastAct = millis(); if (dimmed) { dimmed = false; setBacklight(cfg.bright); } }
++
++// =====================================================================
++//                                 ТАЧ
++// =====================================================================
++#define TOUCH_CS   33
++#define TOUCH_IRQ  36
++#define TOUCH_CLK  25
++#define TOUCH_MISO 39
++#define TOUCH_MOSI 32
++#define CAL_M      20      // отступ калибровочных точек от краёв
++#define LONG_MS    650
++
++SPIClass touchSPI(VSPI);
++XPT2046_Touchscreen ts(TOUCH_CS, TOUCH_IRQ);
++
++struct TouchState {
++  bool down, moved, longDone, swallow, evDown, evTap, evLong, evUp;
++  int x, y, sx, sy;
++  int8_t swipe;            // +1 свайп влево (след. страница), -1 вправо
++  uint32_t t0, lastSeen;
++  long rAx, rAy;
++  int rN;
++} tch;
++
++static inline bool hit(int x, int y, int rx, int ry, int rw, int rh) {
++  return x >= rx && x < rx + rw && y >= ry && y < ry + rh;
++}
++
++void mapRaw(int rx, int ry, int& sx, int& sy) {
++  float a = cfg.cal.swap ? ry : rx;
++  float b = cfg.cal.swap ? rx : ry;
++  sx = constrain((int)(CAL_M + (a - cfg.cal.x0) * cfg.cal.xk), 0, 239);
++  sy = constrain((int)(CAL_M + (b - cfg.cal.y0) * cfg.cal.yk), 0, 319);
++  if (cfg.cal.flip != cfg.flip) { sx = 239 - sx; sy = 319 - sy; }
++}
++
++void touchUpdate() {
++  tch.evDown = tch.evTap = tch.evLong = tch.evUp = false;
++  tch.swipe = 0;
++  uint32_t now = millis();
++  bool pressed = false;
++  int rx = 0, ry = 0;
++  if (ts.touched()) {
++    TS_Point p = ts.getPoint();
++    if (p.z > 350) { pressed = true; rx = p.x; ry = p.y; }
++  }
++  if (pressed) {
++    tch.lastSeen = now;
++    int sx, sy;
++    mapRaw(rx, ry, sx, sy);
++    if (!tch.down) {
++      tch.down = true; tch.moved = false; tch.longDone = false;
++      tch.x = tch.sx = sx; tch.y = tch.sy = sy; tch.t0 = now;
++      tch.rAx = tch.rAy = 0; tch.rN = 0;
++      tch.swallow = dimmed;            // первое касание только будит экран
++      markActivity();
++      tch.evDown = !tch.swallow;
++    } else {
++      tch.x = (tch.x + sx) / 2;
++      tch.y = (tch.y + sy) / 2;
++    }
++    if (tch.rN < 200) { tch.rAx += rx; tch.rAy += ry; tch.rN++; }
++    if (!tch.moved && (abs(tch.x - tch.sx) > 14 || abs(tch.y - tch.sy) > 14)) tch.moved = true;
++    if (!tch.swallow && !tch.moved && !tch.longDone && now - tch.t0 > LONG_MS) {
++      tch.longDone = true;
++      tch.evLong = true;
++    }
++  } else if (tch.down && now - tch.lastSeen > 45) {
++    tch.down = false;
++    if (!tch.swallow) {
++      tch.evUp = true;
++      if (!tch.moved && !tch.longDone) tch.evTap = true;
++      else if (tch.moved) {
++        int dx = tch.x - tch.sx, dy = tch.y - tch.sy;
++        if (abs(dx) >= 40 && abs(dx) > abs(dy) * 3 / 2) tch.swipe = dx < 0 ? 1 : -1;
++      }
++    }
++  }
++}
++
+ // =====================================================================
+ //                               ИНТЕРФЕЙС
+ // =====================================================================
+@@ -522,13 +774,21 @@ void status(const String& s, uint16_t col) {
+   stDirty = true;
+ }
+ 
++String fitText(const String& s, int maxW, int font) {
++  if (textW(s, font) <= maxW) return s;
++  String t = s;
++  while (t.length() > 1 && textW(t + "..", font) > maxW) t.remove(t.length() - 1);
++  return t + "..";
++}
++
+ void drawStatus() {
++  if (scr != S_MAIN) return;       // в настройках шапку не трогаем
+   stDirty = false;
+-  tft.fillCircle(229, 11, 3, stCol);
+-  tft.setTextDatum(TR_DATUM);
++  tft.fillCircle(10, 11, 3, stCol);
++  tft.setTextDatum(TL_DATUM);
+   tft.setTextColor(stCol, COL_PANEL);
+-  tft.setTextPadding(112);
+-  tft.drawString(stText, 220, 3, 2);
++  tft.setTextPadding(140);
++  drawS(fitText(statusText(stText), 138, 2), 18, 3, 2);
+ }
+ 
+ void statusNow(const String& s, uint16_t col = COL_WARN) {
+@@ -540,16 +800,15 @@ void statusNow(const String& s, uint16_t col = COL_WARN) {
+ #define SLOTS 48
+ static String cacheS[SLOTS];
+ static uint16_t cacheC[SLOTS];
+-static int uiMode = -1;
+ static int chipKey = -1;
+ static int litShown = 0;
+-static uint32_t barKey = 0xFFFFFFFF;
++static uint32_t barKeys[4];
+ 
+ void clearCache() {
+   for (int i = 0; i < SLOTS; i++) { cacheS[i] = "\x01"; cacheC[i] = 0; }
+   chipKey = -1;
+   litShown = 0;
+-  barKey = 0xFFFFFFFF;
++  for (int i = 0; i < 4; i++) barKeys[i] = 0xFFFFFFFF;
+ }
+ 
+ void field(uint8_t slot, int x, int y, const String& s, int w, int font,
+@@ -560,7 +819,7 @@ void field(uint8_t slot, int x, int y, const String& s, int w, int font,
+   tft.setTextDatum(datum);
+   tft.setTextColor(fg, bg);
+   tft.setTextPadding(w);
+-  tft.drawString(s, x, y, font);
++  drawS(s, x, y, font);
+ }
+ 
+ uint16_t lerp565(uint16_t a, uint16_t b, uint8_t t) {
+@@ -578,24 +837,35 @@ void label(int x, int y, const char* s, uint8_t datum = TL_DATUM) {
+   tft.setTextDatum(datum);
+   tft.setTextColor(COL_DIM, COL_PANEL);
+   tft.setTextPadding(0);
+-  tft.drawString(s, x, y, 1);
++  drawS(s, x, y, 1);
+ }
+ 
+ uint16_t tempColor(float t) { return t < 45 ? COL_GOOD : t < 60 ? COL_WARN : COL_BAD; }
+ 
+ // ---------- Шапка ----------
++void drawGear(int cx, int cy, uint16_t col, uint16_t bg) {
++  tft.fillRect(cx - 2, cy - 9, 4, 4, col);
++  tft.fillRect(cx - 2, cy + 5, 4, 4, col);
++  tft.fillRect(cx - 9, cy - 2, 4, 4, col);
++  tft.fillRect(cx + 5, cy - 2, 4, 4, col);
++  tft.fillCircle(cx, cy, 6, col);
++  tft.fillCircle(cx, cy, 2, bg);
++}
++
+ void drawHeaderStatic(bool dots) {
+   tft.fillRect(0, 0, 240, 23, COL_PANEL);
+   tft.drawFastHLine(0, 23, 240, COL_TRACK);
+-  tft.setTextPadding(0);
+-  tft.setTextDatum(TL_DATUM);
+-  tft.setTextColor(COL_ACCENT, COL_PANEL);
+-  tft.drawString("OPEN", 10, 3, 2);
+-  tft.setTextColor(COL_TXT, COL_PANEL);
+-  tft.drawString("DASH", 10 + tft.textWidth("OPEN", 2) + 4, 3, 2);
+   if (dots) {
+-    for (int i = 0; i < 3; i++) tft.fillCircle(104 + i * 11, 11, i == page ? 3 : 2, i == page ? COL_ACCENT : COL_TRACK);
++    int n = 0;
++    for (int p = 0; p < 3; p++) if (pageOn(p)) n++;
++    int x = 196 - (n - 1) * 12;
++    for (int p = 0; p < 3; p++) {
++      if (!pageOn(p)) continue;
++      tft.fillCircle(x, 11, p == page ? 3 : 2, p == page ? COL_ACCENT : COL_TRACK);
++      x += 12;
++    }
+   }
++  drawGear(224, 11, COL_DIM, COL_PANEL);
+ }
+ 
+ // ---------- Спидометр ----------
+@@ -603,9 +873,11 @@ void drawHeaderStatic(bool dots) {
+ const int GCX = 120, GCY = 118, GR_O = 82, GR_I = 69;
+ 
+ uint16_t gaugeColor(int i) {
+-  static const uint16_t stops[4] = {C565(0, 200, 255), C565(60, 230, 120), C565(255, 200, 40), C565(255, 60, 60)};
+-  static const float pos[4] = {0.0f, 0.5f, 0.75f, 1.0f};
+   float t = (float)i / (GAUGE_SEGS - 1);
++  if (cfg.style == 1) return COL_ACCENT;
++  if (cfg.style == 2) return t < 0.5f ? COL_GOOD : t < 0.75f ? COL_WARN : COL_BAD;
++  const uint16_t stops[4] = {COL_ACCENT, COL_GOOD, COL_WARN, COL_BAD};
++  static const float pos[4] = {0.0f, 0.5f, 0.75f, 1.0f};
+   for (int k = 0; k < 3; k++)
+     if (t <= pos[k + 1]) return lerp565(stops[k], stops[k + 1], (uint8_t)((t - pos[k]) / (pos[k + 1] - pos[k]) * 255));
+   return stops[3];
+@@ -624,7 +896,7 @@ void gaugeSeg(int i, uint16_t col) {
+ }
+ 
+ void updateGauge(float speed) {
+-  int lit = constrain((int)lroundf(speed / GAUGE_MAX * GAUGE_SEGS), 0, GAUGE_SEGS);
++  int lit = constrain((int)lroundf(speed / gmax() * GAUGE_SEGS), 0, GAUGE_SEGS);
+   if (lit == litShown) return;
+   if (lit > litShown) { for (int i = litShown; i < lit; i++) gaugeSeg(i, gaugeColor(i)); }
+   else                { for (int i = lit; i < litShown; i++) gaugeSeg(i, COL_TRACK); }
+@@ -632,6 +904,9 @@ void updateGauge(float speed) {
+ }
+ 
+ // ---------- Страница 0: панель ----------
++static const int CX[4] = {8, 124, 8, 124};
++static const int CY[4] = {207, 207, 263, 263};
++
+ void dashStatic() {
+   for (int i = 0; i < GAUGE_SEGS; i++) gaugeSeg(i, COL_TRACK);
+   litShown = 0;
+@@ -642,66 +917,107 @@ void dashStatic() {
+   for (int k = 0; k <= 3; k++) {
+     float a = (-120.0f + 80.0f * k) * 0.0174533f;
+     char b[6];
+-    snprintf(b, sizeof(b), "%d", GAUGE_MAX * k / 3);
+-    tft.drawString(b, lroundf(GCX + 57 * sinf(a)), lroundf(GCY - 57 * cosf(a)), 1);
++    snprintf(b, sizeof(b), "%d", gmax() * k / 3);
++    drawS(b, lroundf(GCX + 57 * sinf(a)), lroundf(GCY - 57 * cosf(a)), 1);
+   }
+   tft.setTextColor(COL_ACCENT, COL_BG);
+-  tft.drawString("km/h", GCX, GCY + 20, 2);
+-  card(8, 207, 108, 50);
+-  card(124, 207, 108, 50);
+-  card(8, 263, 108, 50);
+-  card(124, 263, 108, 50);
+-  label(16, 211, "BATTERY");
+-  label(132, 211, "POWER");
+-  label(16, 267, "TRIP");
+-  label(132, 267, "ESC / BAT C");
+-}
+-
+-void drawBar(int lit, uint16_t col) {
++  drawS(uSpd(), GCX, GCY + 20, 2);
++  for (int i = 0; i < 4; i++) {
++    card(CX[i], CY[i], 108, 50);
++    label(CX[i] + 8, CY[i] + 4, metricName(cfg.card[i]));
++  }
++}
++
++void drawBar(int x, int y, int lit, uint16_t col) {
+   for (int i = 0; i < 10; i++)
+-    tft.fillRoundRect(16 + (i * 92) / 10, 243, 7, 6, 2, i < lit ? col : COL_TRACK);
++    tft.fillRoundRect(x + (i * 92) / 10, y, 7, 6, 2, i < lit ? col : COL_TRACK);
++}
++
++struct CardOut { String v, sub; uint16_t col; int bar; };
++
++CardOut metricOut(uint8_t m) {
++  CardOut o;
++  o.v = "--"; o.sub = " "; o.col = COL_DIM; o.bar = -1;
++  const bool hasTotal = (d.valid & ((1U << TOTAL_LO) | (1U << TOTAL_HI))) == ((1U << TOTAL_LO) | (1U << TOTAL_HI));
++  switch (m) {
++    case M_BATT:
++      o.bar = 0;
++      if (d.valid & (1U << SOC)) {
++        o.v = String(d.soc) + "%";
++        o.col = d.soc > 50 ? COL_GOOD : d.soc > 20 ? COL_WARN : COL_BAD;
++        o.bar = (d.soc + 5) / 10;
++      }
++      break;
++    case M_POWER:
++      if ((d.valid & (1U << VOLT)) && (d.valid & (1U << AMP))) {
++        float w = d.volt * d.amp;
++        o.v = String((int)w) + " W";
++        o.col = w < -5 ? COL_GOOD : w > 600 ? COL_WARN : COL_TXT;
++        o.sub = String(d.volt, 1) + "V " + String(d.amp, 1) + "A";
++      } else o.v = "-- W";
++      break;
++    case M_TRIP:
++      if (d.valid & (1U << TRIP)) { o.v = String(kmU(d.tripKm), 2); o.col = COL_TXT; }
++      o.sub = uDst();
++      break;
++    case M_TEMP: {
++      bool he = d.valid & (1U << ETEMP), hb = d.valid & (1U << BTEMP);
++      o.v = (he ? String((int)lroundf(d.escTemp)) : String("--")) + "/" + (hb ? String((int)lroundf(d.battTemp)) : String("--"));
++      o.col = he ? tempColor(d.escTemp) : hb ? tempColor(d.battTemp) : COL_DIM;
++      o.sub = TR("ESC/BAT C", "ESC/АКБ C");
++      break;
++    }
++    case M_ODO:
++      if (hasTotal) {
++        float t = kmU(d.totalKm);
++        o.v = t >= 1000 ? String((int)lroundf(t)) : String(t, 1);
++        o.col = COL_TXT;
++      }
++      o.sub = uDst();
++      break;
++    case M_VOLT:
++      if (d.valid & (1U << VOLT)) { o.v = String(d.volt, 1) + " V"; o.col = COL_TXT; }
++      break;
++    case M_CURR:
++      if (d.valid & (1U << AMP)) { o.v = String(d.amp, 1) + " A"; o.col = d.amp < -0.5f ? COL_GOOD : COL_TXT; }
++      break;
++    case M_MAXSPD:
++      if (d.valid & (1U << SPEED)) { o.v = String(kmU(sessionMax), 1); o.col = COL_TXT; }
++      o.sub = String(uSpd()) + " " + TR("this ride", "за поездку");
++      break;
++  }
++  return o;
+ }
+ 
+ void dashDynamic() {
+   const bool hasSpeed = d.valid & (1U << SPEED);
+-  const bool hasSoc = d.valid & (1U << SOC);
+-  const bool hasV = d.valid & (1U << VOLT);
+-  const bool hasA = d.valid & (1U << AMP);
+   const bool hasTotal = (d.valid & ((1U << TOTAL_LO) | (1U << TOTAL_HI))) == ((1U << TOTAL_LO) | (1U << TOTAL_HI));
+ 
+-  updateGauge(hasSpeed ? d.speed : 0);
+-  field(0, GCX, GCY - 8, hasSpeed ? String(d.speed, 1) : String("--"), 120, 7, COL_TXT, MC_DATUM, COL_BG);
+-  field(1, GCX, 188, hasTotal ? "ODO " + String(d.totalKm, 1) + " km" : String("ODO -- km"), 150, 2, COL_DIM, MC_DATUM, COL_BG);
+-
+-  // Батарея
+-  uint16_t bc = !hasSoc ? COL_DIM : d.soc > 50 ? COL_GOOD : d.soc > 20 ? COL_WARN : COL_BAD;
+-  field(2, 16, 225, hasSoc ? String(d.soc) + "%" : String("--"), 90, 4, bc, TL_DATUM, COL_PANEL);
+-  int lit = hasSoc ? (d.soc + 5) / 10 : 0;
+-  uint32_t key = ((uint32_t)lit << 16) | bc;
+-  if (key != barKey) { barKey = key; drawBar(lit, bc); }
++  updateGauge(hasSpeed ? kmU(d.speed) : 0);
++  field(0, GCX, GCY - 8, hasSpeed ? String(kmU(d.speed), 1) : String("--"), 120, 7, COL_TXT, MC_DATUM, COL_BG);
++  field(1, GCX, 188, hasTotal ? TR("ODO ", "ОДО ") + String(kmU(d.totalKm), 1) + " " + uDst() : String(TR("ODO -- ", "ОДО -- ")) + uDst(), 150, 2, COL_DIM, MC_DATUM, COL_BG);
+ 
+-  // Мощность
+-  float w = d.volt * d.amp;
+-  uint16_t pc = w < -5 ? COL_GOOD : w > 600 ? COL_WARN : COL_TXT;
+-  field(3, 132, 225, hasV && hasA ? String((int)w) + " W" : String("-- W"), 96, 4, pc, TL_DATUM, COL_PANEL);
+-  field(4, 132, 246, hasV && hasA ? String(d.volt, 1) + "V " + String(d.amp, 1) + "A" : String("--"), 96, 1, COL_DIM, TL_DATUM, COL_PANEL);
+-
+-  // Поездка
+-  field(5, 16, 281, d.valid & (1U << TRIP) ? String(d.tripKm, 2) : String("--"), 90, 4, COL_TXT, TL_DATUM, COL_PANEL);
+-
+-  // Температуры
+-  bool he = d.valid & (1U << ETEMP), hb = d.valid & (1U << BTEMP);
+-  field(6, 132, 281, he && hb ? String((int)lroundf(d.escTemp)) + " / " + String((int)lroundf(d.battTemp)) :
+-        he ? String((int)lroundf(d.escTemp)) + " / --" :
+-        hb ? String("-- / ") + String((int)lroundf(d.battTemp)) : String("-- / --"),
+-        96, 2, he ? tempColor(d.escTemp) : hb ? tempColor(d.battTemp) : COL_DIM, TL_DATUM, COL_PANEL);
++  for (int i = 0; i < 4; i++) {
++    CardOut c = metricOut(cfg.card[i] % M_COUNT);
++    field(2 + 2 * i, CX[i] + 8, CY[i] + 18, c.v, 92, 4, c.col, TL_DATUM, COL_PANEL);
++    if (c.bar >= 0) {
++      uint32_t key = ((uint32_t)c.bar << 16) | c.col;
++      if (key != barKeys[i]) { barKeys[i] = key; drawBar(CX[i] + 8, CY[i] + 36, c.bar, c.col); }
++    } else {
++      field(3 + 2 * i, CX[i] + 8, CY[i] + 39, c.sub, 92, 1, COL_DIM, TL_DATUM, COL_PANEL);
++    }
++  }
+ }
+ 
+ // ---------- Страница 1: информация ----------
+ static void tileXY(int i, int& x, int& y) { x = 6; y = 28 + i * 36; }
+ 
+ void infoStatic() {
+-  const char* L[8] = {"DEVICE", "SERIAL", "FIRMWARE", "ODOMETER (km)", "TRIP (km)", "VOLTAGE (V)", "CURRENT (A)", "ESC / BAT TEMP"};
++  char odoL[28], tripL[28];
++  snprintf(odoL, sizeof(odoL), TR("ODOMETER (%s)", "Одометр (%s)"), uDst());
++  snprintf(tripL, sizeof(tripL), TR("TRIP (%s)", "Поездка (%s)"), uDst());
++  const char* L[8] = {TR("DEVICE", "Устройство"), TR("SERIAL", "Серийный номер"), TR("FIRMWARE", "Прошивка"), odoL, tripL,
++                      TR("VOLTAGE (V)", "Напряжение (В)"), TR("CURRENT (A)", "Ток (А)"), TR("ESC / BAT TEMP", "Темп. ESC / АКБ")};
+   for (int i = 0; i < 8; i++) {
+     int x, y;
+     tileXY(i, x, y);
+@@ -718,8 +1034,8 @@ void infoDynamic() {
+     devName,
+     d.serial[0] ? String(d.serial) : String("--"),
+     d.fw ? String(b) : String("--"),
+-    hasTotal ? String(d.totalKm, 1) : String("--"),
+-    d.valid & (1U << TRIP) ? String(d.tripKm, 2) : String("--"),
++    hasTotal ? String(kmU(d.totalKm), 1) : String("--"),
++    d.valid & (1U << TRIP) ? String(kmU(d.tripKm), 2) : String("--"),
+     d.valid & (1U << VOLT) ? String(d.volt, 2) : String("--"),
+     d.valid & (1U << AMP) ? String(d.amp, 2) : String("--"),
+     String(d.valid & (1U << ETEMP) ? String((int)lroundf(d.escTemp)) : String("--")) + " / " +
+@@ -768,6 +1084,20 @@ void debugDynamic() {
+ }
+ 
+ // ---------- Экран подключения ----------
++void connectStatic() {
++  tft.setTextPadding(0);
++  tft.setTextDatum(TL_DATUM);
++  int w1 = tft.textWidth("OPEN", 2), w2 = tft.textWidth("DASH", 2);
++  int x = 120 - (w1 + 4 + w2) / 2;
++  tft.setTextColor(COL_ACCENT, COL_BG);
++  drawS("OPEN", x, 31, 2);
++  tft.setTextColor(COL_TXT, COL_BG);
++  drawS("DASH", x + w1 + 4, 31, 2);
++  tft.setTextDatum(MC_DATUM);
++  tft.setTextColor(COL_DIM, COL_BG);
++  drawS(TR("Tap the gear for settings", "Настройки: значок шестерёнки"), 120, 292, 1);
++}
++
+ void connectDynamic() {
+   int phase;
+   if (!connected) phase = 0;
+@@ -786,48 +1116,281 @@ void connectDynamic() {
+     int dd = (head - i + 12) % 12;
+     uint8_t alpha = dd < 7 ? 255 - dd * 36 : 20;
+     float a = i * 30 * 0.0174533f;
+-    tft.fillCircle(120 + lroundf(34 * sinf(a)), 92 - lroundf(34 * cosf(a)), 5, lerp565(COL_BG, base, alpha));
++    tft.fillCircle(120 + lroundf(34 * sinf(a)), 100 - lroundf(34 * cosf(a)), 5, lerp565(COL_BG, base, alpha));
+   }
+ 
+-  static const char* titles[4] = {"SEARCHING", "CONNECTING", "PRESS POWER", "PAIRING"};
+-  static const char* subs[4] = {"Turn on the scooter and stay close", "Starting secure handshake",
+-                                "Press the scooter power button once", "Almost there..."};
+-  field(40, 120, 148, titles[phase], 224, 4, power ? COL_WARN : COL_TXT, MC_DATUM, COL_BG);
+-  field(41, 120, 180, subs[phase], 224, 2, COL_DIM, MC_DATUM, COL_BG);
++  const char* titles[4] = {TR("SEARCHING", "Поиск"), TR("CONNECTING", "Подключение"), TR("PRESS POWER", "Нажмите кнопку"), TR("PAIRING", "Сопряжение")};
++  const char* subs[4] = {TR("Turn on the scooter and stay close", "Включите самокат и будьте рядом"),
++                         TR("Starting secure handshake", "Устанавливаем защищённую связь"),
++                         TR("Press the scooter power button once", "Нажмите кнопку питания самоката"),
++                         TR("Almost there...", "Почти готово...")};
++  field(40, 120, 156, titles[phase], 224, 4, power ? COL_WARN : COL_TXT, MC_DATUM, COL_BG);
++  field(41, 120, 186, subs[phase], 224, 2, COL_DIM, MC_DATUM, COL_BG);
+ 
+   int key = phase * 2 + (blink ? 1 : 0);
+   if (key != chipKey) {
+     chipKey = key;
+-    static const char* names[4] = {"SCAN", "LINK", "POWER", "PAIR"};
++    const char* names[4] = {TR("SCAN", "Поиск"), TR("LINK", "Связь"), TR("POWER", "Кнопка"), TR("PAIR", "Пара")};
+     for (int i = 0; i < 4; i++) {
+       int x = 8 + i * 57;
+       uint16_t fill, fg;
+-      if (i < phase)       { fill = C565(0, 70, 96); fg = COL_TXT; }
++      if (i < phase)       { fill = lerp565(COL_PANEL, COL_ACCENT, 90); fg = COL_TXT; }
+       else if (i == phase) { fill = blink ? COL_TXT : base; fg = COL_BG; }
+       else                 { fill = COL_PANEL; fg = COL_DIM; }
+-      tft.fillRoundRect(x, 220, 52, 26, 6, fill);
++      tft.fillRoundRect(x, 224, 52, 26, 6, fill);
+       tft.setTextDatum(MC_DATUM);
+       tft.setTextColor(fg, fill);
+       tft.setTextPadding(0);
+-      tft.drawString(names[i], x + 26, 227, 1);
++      drawS(names[i], x + 26, 231, 1);
++    }
++  }
++}
++
++// =====================================================================
++//                         ЭКРАНЫ НАСТРОЕК
++// =====================================================================
++void btn(int x, int y, int w, int h, const char* txt, bool sel, int font = 2) {
++  uint16_t fill = sel ? COL_ACCENT : COL_PANEL;
++  uint16_t fg = sel ? COL_BG : COL_TXT;
++  tft.fillRoundRect(x, y, w, h, 6, fill);
++  tft.setTextDatum(MC_DATUM);
++  tft.setTextColor(fg, fill);
++  tft.setTextPadding(0);
++  drawS(txt, x + w / 2, y + h / 2, font);
++}
++
++void secLabel(int x, int y, const char* s) {
++  tft.setTextDatum(TL_DATUM);
++  tft.setTextColor(COL_DIM, COL_BG);
++  tft.setTextPadding(0);
++  drawS(s, x, y, 1);
++}
++
++void settingsHeader(const char* title) {
++  tft.fillRect(0, 0, 240, 28, COL_PANEL);
++  tft.drawFastHLine(0, 28, 240, COL_TRACK);
++  tft.fillTriangle(16, 14, 25, 7, 25, 21, COL_ACCENT);
++  tft.setTextDatum(MC_DATUM);
++  tft.setTextColor(COL_TXT, COL_PANEL);
++  tft.setTextPadding(0);
++  drawS(title, 130, 14, 2);
++}
++
++void drawSlider(int y, float frac) {
++  frac = constrain(frac, 0.0f, 1.0f);
++  tft.fillRoundRect(10, y, 220, 28, 8, COL_PANEL);
++  tft.fillRoundRect(10, y, 12 + (int)(frac * 208), 28, 8, COL_ACCENT);
++}
++
++void drawBrightness() {
++  char b[8];
++  snprintf(b, sizeof(b), "%d%%", cfg.bright);
++  tft.setTextDatum(TR_DATUM);
++  tft.setTextColor(COL_ACCENT, COL_BG);
++  tft.setTextPadding(48);
++  drawS(b, 232, 34, 2);
++  drawSlider(52, (cfg.bright - 10) / 90.0f);
++}
++
++void drawHueSlider() {
++  tft.fillRect(8, 200, 224, 6, COL_BG);
++  tft.fillRect(8, 236, 224, 6, COL_BG);
++  for (int i = 0; i < 220; i++) tft.drawFastVLine(10 + i, 206, 30, hue565(i * 359 / 219));
++  int kx = 10 + cfg.hue * 219 / 359;
++  tft.fillRoundRect(kx - 4, 201, 9, 40, 3, COL_TXT);
++  tft.fillRect(kx - 2, 206, 5, 30, hue565(cfg.hue));
++}
++
++void drawGaugePreview() {
++  for (int i = 0; i < GAUGE_SEGS; i++) tft.fillRect(20 + i * 5, 250, 4, 18, gaugeColor(i));
++}
++
++void drawSettingsScreen() {
++  char b[56];
++  switch (scr) {
++    case S_SET: {
++      settingsHeader(TR("SETTINGS", "Настройки"));
++      const char* titles[7] = {TR("APPEARANCE", "Внешний вид"), TR("DISPLAY", "Экран"), TR("GAUGE & UNITS", "Шкала и единицы"),
++                               TR("WIDGETS & PAGES", "Виджеты и страницы"), TR("LANGUAGE", "Язык"),
++                               TR("TOUCH CALIBRATION", "Калибровка тача"), TR("RESET TO DEFAULTS", "Сброс настроек")};
++      char dm[10];
++      if (cfg.dim) snprintf(dm, sizeof(dm), TR("%ds", "%d с"), DIM_SEC[cfg.dim]); else strcpy(dm, TR("off", "выкл"));
++      const char* tn = cfg.lang ? THEMES[cfg.theme].nameRu : THEMES[cfg.theme].name;
++      const char* an = cfg.accent < 8 ? (cfg.lang ? ACCENT_NAME_RU[cfg.accent] : ACCENT_NAME[cfg.accent]) : TR("custom", "свой");
++      const char* sn = cfg.lang ? STYLE_NAME_RU[cfg.style] : STYLE_NAME[cfg.style];
++      char sub[7][56];
++      snprintf(sub[0], 56, TR("%s theme, %s accent", "%s, акцент: %s"), tn, an);
++      snprintf(sub[1], 56, TR("brightness %d%%, auto-dim %s", "яркость %d%%, затемнение: %s"), cfg.bright, dm);
++      snprintf(sub[2], 56, TR("%s, max %d, %s gauge", "%s, макс. %d, шкала: %s"), uSpd(), gmax(), sn);
++      snprintf(sub[3], 56, TR("4 cards, info %s, debug %s", "инфо: %s, отладка: %s"),
++               cfg.showInfo ? TR("on", "вкл") : TR("off", "выкл"), cfg.showDebug ? TR("on", "вкл") : TR("off", "выкл"));
++      snprintf(sub[4], 56, "%s", cfg.lang ? "Русский (нажмите: English)" : "English (tap: Русский)");
++      snprintf(sub[5], 56, "%s", TR("re-map the touch panel (3 taps)", "откалибровать сенсор (3 касания)"));
++      snprintf(sub[6], 56, "%s", TR("press and HOLD to restore defaults", "удерживайте для сброса"));
++      for (int i = 0; i < 7; i++) {
++        int y = 34 + i * 41;
++        tft.fillRoundRect(8, y, 224, 36, 6, COL_PANEL);
++        tft.fillRect(8, y + 7, 3, 22, i == 6 ? COL_BAD : COL_ACCENT);
++        tft.setTextDatum(TL_DATUM);
++        tft.setTextPadding(0);
++        tft.setTextColor(i == 6 ? COL_BAD : COL_TXT, COL_PANEL);
++        drawS(titles[i], 20, y + 3, 2);
++        tft.setTextColor(COL_DIM, COL_PANEL);
++        drawS(sub[i], 20, y + 22, 1);
++        if (i != 4) {
++          tft.drawLine(216, y + 12, 222, y + 18, COL_DIM);
++          tft.drawLine(222, y + 18, 216, y + 24, COL_DIM);
++        }
++      }
++      break;
++    }
++    case S_APPEAR: {
++      settingsHeader(TR("APPEARANCE", "Внешний вид"));
++      secLabel(8, 36, TR("THEME", "Тема"));
++      for (int i = 0; i < 4; i++) {
++        int x = 8 + i * 58, y = 48;
++        const Theme& t = THEMES[i];
++        tft.fillRoundRect(x, y, 54, 40, 6, t.bg);
++        tft.drawRoundRect(x, y, 54, 40, 6, cfg.theme == i ? COL_ACCENT : COL_TRACK);
++        if (cfg.theme == i) tft.drawRoundRect(x + 1, y + 1, 52, 38, 5, COL_ACCENT);
++        tft.fillRoundRect(x + 6, y + 6, 42, 12, 3, t.panel);
++        tft.setTextDatum(MC_DATUM);
++        tft.setTextColor(t.txt, t.bg);
++        tft.setTextPadding(0);
++        drawS(cfg.lang ? t.nameRu : t.name, x + 27, y + 29, 1);
++      }
++      secLabel(8, 98, TR("ACCENT COLOR", "Цвет акцента"));
++      for (int i = 0; i < 8; i++) {
++        int x = 8 + (i % 4) * 58, y = 110 + (i / 4) * 38;
++        tft.fillRoundRect(x, y, 54, 34, 6, ACCENTS[i]);
++        if (cfg.accent == i) {
++          tft.drawRoundRect(x, y, 54, 34, 6, COL_TXT);
++          tft.drawRoundRect(x + 1, y + 1, 52, 32, 5, COL_TXT);
++          tft.fillCircle(x + 27, y + 17, 4, COL_BG);
++        }
++      }
++      secLabel(8, 190, TR("CUSTOM HUE (drag)", "Свой оттенок (проведите пальцем)"));
++      drawHueSlider();
++      secLabel(8, 254, TR("Pick a preset or drag the hue strip.", "Выберите цвет или двигайте полосу."));
++      break;
++    }
++    case S_DISPLAY: {
++      settingsHeader(TR("DISPLAY", "Экран"));
++      secLabel(8, 38, TR("BRIGHTNESS", "Яркость"));
++      drawBrightness();
++      secLabel(8, 98, TR("AUTO-DIM WHEN IDLE", "Затемнение при бездействии"));
++      const char* dl[4] = {TR("OFF", "Выкл"), TR("15 s", "15 с"), TR("30 s", "30 с"), TR("60 s", "60 с")};
++      for (int i = 0; i < 4; i++) btn(8 + i * 58, 110, 54, 40, dl[i], cfg.dim == i);
++      secLabel(8, 160, TR("ORIENTATION", "Ориентация"));
++      btn(8, 172, 108, 40, TR("NORMAL", "Обычная"), cfg.flip == 0);
++      btn(124, 172, 108, 40, TR("FLIPPED 180", "Перевёрнута"), cfg.flip == 1);
++      secLabel(8, 222, TR("RIDE LOCK (ignore taps above 3 km/h)", "Блок. в движении (быстрее 3 км/ч)"));
++      btn(8, 234, 108, 40, TR("ON", "Вкл"), cfg.lock == 1);
++      btn(124, 234, 108, 40, TR("OFF", "Выкл"), cfg.lock == 0);
++      secLabel(8, 284, TR("Swipes between pages always work.", "Свайпы страниц работают всегда."));
++      break;
++    }
++    case S_GAUGE: {
++      settingsHeader(TR("GAUGE & UNITS", "Шкала и единицы"));
++      secLabel(8, 36, TR("SPEED UNIT", "Единицы скорости"));
++      btn(8, 48, 108, 44, TR("KM/H", "км/ч"), cfg.units == 0);
++      btn(124, 48, 108, 44, TR("MPH", "миль/ч"), cfg.units == 1);
++      secLabel(8, 104, TR("GAUGE MAX (step 3)", "Максимум шкалы (шаг 3)"));
++      btn(8, 116, 64, 44, "-", false, 4);
++      btn(168, 116, 64, 44, "+", false, 4);
++      tft.setTextDatum(MC_DATUM);
++      tft.setTextPadding(0);
++      tft.setTextColor(COL_TXT, COL_BG);
++      snprintf(b, sizeof(b), "%d", gmax());
++      drawS(b, 120, 131, 4);
++      tft.setTextColor(COL_DIM, COL_BG);
++      drawS(uSpd(), 120, 150, 1);
++      secLabel(8, 172, TR("GAUGE COLORS", "Цвета шкалы"));
++      btn(8, 184, 72, 44, TR("FADE", "Плавно"), cfg.style == 0);
++      btn(84, 184, 72, 44, TR("SOLID", "Один"), cfg.style == 1);
++      btn(160, 184, 72, 44, TR("ZONES", "Зоны"), cfg.style == 2);
++      secLabel(8, 238, TR("PREVIEW", "Предпросмотр"));
++      drawGaugePreview();
++      break;
++    }
++    case S_WIDGETS: {
++      settingsHeader(TR("WIDGETS & PAGES", "Виджеты и страницы"));
++      secLabel(8, 36, TR("TAP A CARD TO CHOOSE ITS DATA", "Нажмите карточку, чтобы выбрать данные"));
++      for (int i = 0; i < 4; i++) {
++        int x = 8 + (i % 2) * 116, y = 48 + (i / 2) * 70;
++        tft.fillRoundRect(x, y, 108, 64, 6, COL_PANEL);
++        tft.fillRect(x, y + 12, 3, 40, COL_ACCENT);
++        snprintf(b, sizeof(b), TR("CARD %d", "Карточка %d"), i + 1);
++        tft.setTextDatum(TL_DATUM);
++        tft.setTextPadding(0);
++        tft.setTextColor(COL_DIM, COL_PANEL);
++        drawS(b, x + 10, y + 8, 1);
++        tft.setTextDatum(MC_DATUM);
++        tft.setTextColor(COL_TXT, COL_PANEL);
++        drawS(metricName(cfg.card[i]), x + 54, y + 38, 2);
++      }
++      secLabel(8, 194, TR("PAGES", "Страницы"));
++      snprintf(b, sizeof(b), TR("INFO: %s", "Инфо: %s"), cfg.showInfo ? TR("ON", "вкл") : TR("OFF", "выкл"));
++      btn(8, 206, 108, 44, b, cfg.showInfo);
++      snprintf(b, sizeof(b), TR("DEBUG: %s", "Отладка: %s"), cfg.showDebug ? TR("ON", "вкл") : TR("OFF", "выкл"));
++      btn(124, 206, 108, 44, b, cfg.showDebug);
++      secLabel(8, 262, TR("On the dashboard: tap a card = next data,", "Нажатие на карточку: следующие данные,"));
++      secLabel(8, 274, TR("hold a card = pick from list,", "удержание: выбор из списка,"));
++      secLabel(8, 286, TR("tap the gauge = switch km/h / mph.", "нажатие на шкалу: км/ч / миль/ч."));
++      break;
+     }
++    case S_PICK: {
++      settingsHeader(TR("CHOOSE DATA", "Выбор данных"));
++      for (int i = 0; i < M_COUNT; i++)
++        btn(8 + (i % 2) * 116, 36 + (i / 2) * 50, 108, 44, metricName(i), cfg.card[pickSlot] == i);
++      snprintf(b, sizeof(b), TR("Card %d", "Карточка %d"), pickSlot + 1);
++      secLabel(8, 244, b);
++      break;
++    }
++    case S_CAL: {
++      static const int TX[3] = {CAL_M, 239 - CAL_M, CAL_M};
++      static const int TY[3] = {CAL_M, CAL_M, 319 - CAL_M};
++      tft.setTextDatum(MC_DATUM);
++      tft.setTextPadding(0);
++      tft.setTextColor(COL_TXT, COL_BG);
++      drawS(TR("TOUCH CALIBRATION", "Калибровка тача"), 120, 120, 2);
++      snprintf(b, sizeof(b), TR("Tap the target (%d / 3)", "Коснитесь метки (%d / 3)"), calStep + 1);
++      tft.setTextColor(COL_DIM, COL_BG);
++      drawS(b, 120, 150, 2);
++      if (calFail) { tft.setTextColor(COL_BAD, COL_BG); drawS(TR("Points too close - try again", "Слишком близко, повторите"), 120, 176, 2); }
++      tft.setTextColor(COL_DIM, COL_BG);
++      drawS(cfg.cal.valid ? TR("BOOT button = cancel", "Кнопка BOOT: отмена") : TR("A stylus gives best accuracy", "Лучше использовать стилус"), 120, 200, 1);
++      int x = TX[calStep], y = TY[calStep];
++      tft.drawCircle(x, y, 10, COL_ACCENT);
++      tft.drawCircle(x, y, 5, COL_ACCENT);
++      tft.drawFastHLine(x - 16, y, 33, COL_ACCENT);
++      tft.drawFastVLine(x, y - 16, 33, COL_ACCENT);
++      break;
++    }
++    default: break;
+   }
+ }
+ 
+ // ---------- Диспетчер экрана ----------
+ void drawUi() {
+   bool live = connected && authState == AUTH_READY;
+-  int mode = live ? 1 + page : 0;
++  int mode = scr != S_MAIN ? 100 + (int)scr : (live ? 1 + page : 0);
+   if (mode != uiMode) {
+     uiMode = mode;
+     clearCache();
+     tft.fillScreen(COL_BG);
+-    drawHeaderStatic(mode > 0);
+-    stDirty = true;
+-    if (mode == 1) dashStatic();
+-    else if (mode == 2) infoStatic();
+-    else if (mode == 3) debugStatic();
++    if (scr == S_MAIN) {
++      drawHeaderStatic(mode > 0);
++      stDirty = true;
++      if (mode == 0) connectStatic();
++      else if (mode == 1) dashStatic();
++      else if (mode == 2) infoStatic();
++      else debugStatic();
++    } else {
++      drawSettingsScreen();
++    }
+   }
++  if (scr != S_MAIN) return;
+   if (stDirty) drawStatus();
+   if (mode == 0) connectDynamic();
+   else if (mode == 1) dashDynamic();
+@@ -835,6 +1398,251 @@ void drawUi() {
+   else debugDynamic();
+ }
+ 
++// =====================================================================
++//                         ОБРАБОТКА КАСАНИЙ
++// =====================================================================
++void goScr(Scr s) { scr = s; uiMode = -1; }
++void openSettings() { goScr(S_SET); }
++void leaveSettings() { goScr(S_MAIN); }
++void openPicker(uint8_t slot, Scr ret) { pickSlot = slot; pickReturn = ret; goScr(S_PICK); }
++
++void goBack() {
++  switch (scr) {
++    case S_SET: leaveSettings(); break;
++    case S_PICK: if (pickReturn == S_MAIN) leaveSettings(); else goScr(S_WIDGETS); break;
++    case S_CAL: if (cfg.cal.valid) goScr(calFromBoot ? S_MAIN : S_SET); break;
++    default: goScr(S_SET); break;
++  }
++}
++
++void applyDisplayCfg() {
++  tft.setRotation(cfg.flip ? 2 : 0);
++  setBacklight(cfg.bright);
++  applyTheme();
++}
++
++bool finishCal() {
++  float ax0, ax1, ay0, ay1;
++  bool sw = fabsf(calRaw[1][1] - calRaw[0][1]) > fabsf(calRaw[1][0] - calRaw[0][0]);
++  ax0 = sw ? calRaw[0][1] : calRaw[0][0];
++  ax1 = sw ? calRaw[1][1] : calRaw[1][0];
++  ay0 = sw ? calRaw[0][0] : calRaw[0][1];
++  ay1 = sw ? calRaw[2][0] : calRaw[2][1];
++  if (fabsf(ax1 - ax0) < 300 || fabsf(ay1 - ay0) < 300) return false;
++  cfg.cal.swap = sw;
++  cfg.cal.x0 = ax0;
++  cfg.cal.xk = (239 - 2 * CAL_M) / (ax1 - ax0);
++  cfg.cal.y0 = ay0;
++  cfg.cal.yk = (319 - 2 * CAL_M) / (ay1 - ay0);
++  cfg.cal.flip = cfg.flip;
++  cfg.cal.valid = 1;
++  return true;
++}
++
++void touchCal() {
++  if (!tch.evUp || tch.rN < 3) return;
++  calRaw[calStep][0] = (float)tch.rAx / tch.rN;
++  calRaw[calStep][1] = (float)tch.rAy / tch.rN;
++  calStep++;
++  if (calStep >= 3) {
++    if (finishCal()) {
++      saveSettings();
++      goScr(calFromBoot ? S_MAIN : S_SET);
++      calFromBoot = false;
++      calFail = false;
++      calStep = 0;
++      return;
++    }
++    calStep = 0;
++    calFail = true;
++  } else {
++    calFail = false;
++  }
++  uiMode = -1;
++}
++
++void touchMain() {
++  const bool live = connected && authState == AUTH_READY;
++  const bool locked = cfg.lock && live && d.speed > 3.0f;
++  if (tch.swipe && live) { nextPage(tch.swipe > 0 ? 1 : -1); return; }
++  if (locked) return;
++  const bool onDash = live && page == 0;
++  if (tch.evTap) {
++    int x = tch.sx, y = tch.sy;
++    if (hit(x, y, 196, 0, 44, 44)) { openSettings(); return; }
++    if (live && hit(x, y, 150, 0, 46, 44)) { nextPage(1); uiMode = -1; return; }
++    if (onDash) {
++      for (int i = 0; i < 4; i++)
++        if (hit(x, y, CX[i], CY[i], 108, 50)) {
++          cfg.card[i] = (cfg.card[i] + 1) % M_COUNT;
++          queueSave();
++          uiMode = -1;
++          return;
++        }
++      if (hit(x, y, 0, 44, 240, 158)) { cfg.units ^= 1; queueSave(); uiMode = -1; return; }
++    }
++  }
++  if (tch.evLong && onDash) {
++    for (int i = 0; i < 4; i++)
++      if (hit(tch.sx, tch.sy, CX[i], CY[i], 108, 50)) { openPicker(i, S_MAIN); return; }
++  }
++}
++
++void touchSettings() {
++  static int dragId = -1;
++  // ---- ползунки (перетаскивание) ----
++  if (tch.evDown) {
++    dragId = -1;
++    if (scr == S_APPEAR && hit(tch.sx, tch.sy, 0, 196, 240, 50)) dragId = 1;
++    else if (scr == S_DISPLAY && hit(tch.sx, tch.sy, 0, 44, 240, 50)) dragId = 2;
++  }
++  if (dragId >= 0) {
++    float f = constrain((tch.x - 10) / 220.0f, 0.0f, 1.0f);
++    if (dragId == 1) {
++      int h = (int)(f * 359);
++      if (h != cfg.hue || cfg.accent != 8) { cfg.hue = h; cfg.accent = 8; drawHueSlider(); }
++    } else {
++      int bv = 10 + (int)(f * 90);
++      if (bv != cfg.bright) { cfg.bright = bv; setBacklight(bv); drawBrightness(); }
++    }
++    if (!tch.down) {
++      int id = dragId;
++      dragId = -1;
++      queueSave();
++      if (id == 1) { applyTheme(); uiMode = -1; }
++    }
++    return;
++  }
++
++  if (tch.swipe) return;
++  const int x = tch.sx, y = tch.sy;
++
++  if (tch.evTap && hit(x, y, 0, 0, 80, 32)) { goBack(); return; }
++
++  switch (scr) {
++    case S_SET:
++      for (int i = 0; i < 7; i++) {
++        if (!hit(x, y, 8, 34 + i * 41, 224, 36)) continue;
++        if (tch.evTap) {
++          if (i <= 3) goScr((Scr)(S_APPEAR + i));
++          else if (i == 4) { cfg.lang ^= 1; queueSave(); uiMode = -1; }      // язык переключается сразу
++          else if (i == 5) { calStep = 0; calFail = false; calFromBoot = false; goScr(S_CAL); }
++        }
++        if (tch.evLong && i == 6) {
++          setDefaults(true);
++          applyDisplayCfg();
++          saveSettings();
++          uiMode = -1;
++        }
++      }
++      break;
++
++    case S_APPEAR:
++      if (!tch.evTap) break;
++      for (int i = 0; i < 4; i++)
++        if (hit(x, y, 8 + i * 58, 48, 54, 40)) { cfg.theme = i; applyTheme(); queueSave(); uiMode = -1; return; }
++      for (int i = 0; i < 8; i++)
++        if (hit(x, y, 8 + (i % 4) * 58, 110 + (i / 4) * 38, 54, 34)) { cfg.accent = i; applyTheme(); queueSave(); uiMode = -1; return; }
++      break;
++
++    case S_DISPLAY:
++      if (!tch.evTap) break;
++      for (int i = 0; i < 4; i++)
++        if (hit(x, y, 8 + i * 58, 110, 54, 40)) { cfg.dim = i; queueSave(); uiMode = -1; return; }
++      if (hit(x, y, 8, 172, 108, 40))   { cfg.flip = 0; applyDisplayCfg(); queueSave(); uiMode = -1; }
++      if (hit(x, y, 124, 172, 108, 40)) { cfg.flip = 1; applyDisplayCfg(); queueSave(); uiMode = -1; }
++      if (hit(x, y, 8, 234, 108, 40))   { cfg.lock = 1; queueSave(); uiMode = -1; }
++      if (hit(x, y, 124, 234, 108, 40)) { cfg.lock = 0; queueSave(); uiMode = -1; }
++      break;
++
++    case S_GAUGE: {
++      if (!tch.evTap) break;
++      uint8_t& gm = cfg.units ? cfg.gmaxMph : cfg.gmaxKmh;
++      if (hit(x, y, 8, 48, 108, 44))   { cfg.units = 0; }
++      else if (hit(x, y, 124, 48, 108, 44)) { cfg.units = 1; }
++      else if (hit(x, y, 8, 116, 64, 44))   { if (gm > 15) gm -= 3; }
++      else if (hit(x, y, 168, 116, 64, 44)) { if (gm < 60) gm += 3; }
++      else if (hit(x, y, 8, 184, 72, 44))   { cfg.style = 0; }
++      else if (hit(x, y, 84, 184, 72, 44))  { cfg.style = 1; }
++      else if (hit(x, y, 160, 184, 72, 44)) { cfg.style = 2; }
++      else break;
++      queueSave();
++      uiMode = -1;
++      break;
++    }
++
++    case S_WIDGETS:
++      if (!tch.evTap) break;
++      for (int i = 0; i < 4; i++)
++        if (hit(x, y, 8 + (i % 2) * 116, 48 + (i / 2) * 70, 108, 64)) { openPicker(i, S_WIDGETS); return; }
++      if (hit(x, y, 8, 206, 108, 44))   { cfg.showInfo ^= 1; page = 0; queueSave(); uiMode = -1; }
++      if (hit(x, y, 124, 206, 108, 44)) { cfg.showDebug ^= 1; page = 0; queueSave(); uiMode = -1; }
++      break;
++
++    case S_PICK:
++      if (!tch.evTap) break;
++      for (int i = 0; i < M_COUNT; i++)
++        if (hit(x, y, 8 + (i % 2) * 116, 36 + (i / 2) * 50, 108, 44)) {
++          cfg.card[pickSlot] = i;
++          queueSave();
++          if (pickReturn == S_MAIN) leaveSettings(); else goScr(S_WIDGETS);
++          return;
++        }
++      break;
++
++    default: break;
++  }
++}
++
++void handleTouch() {
++  touchUpdate();
++  if (scr == S_MAIN) touchMain();
++  else if (scr == S_CAL) touchCal();
++  else touchSettings();
++}
++
++void housekeeping() {
++  uint32_t now = millis();
++  if (saveDue && (int32_t)(now - saveAt) >= 0) { saveDue = false; saveSettings(); }
++  if (connected && authState == AUTH_READY && d.speed > 1.0f) markActivity();   // в движении не гасим экран
++  if (cfg.dim && !dimmed && now - lastAct > (uint32_t)DIM_SEC[cfg.dim] * 1000UL) {
++    dimmed = true;
++    setBacklight(max(5, (int)cfg.bright / 6));
++  }
++  if (connected && authState == AUTH_READY && d.speed > sessionMax) sessionMax = d.speed;
++}
++
++void handleButton() {
++  static uint32_t downAt = 0;
++  static bool wasDown = false;
++  bool down = digitalRead(BTN_PIN) == LOW;
++  if (down && !wasDown) { downAt = millis(); markActivity(); }
++  if (!down && wasDown) {
++    uint32_t dt = millis() - downAt;
++    if (dt > 1500) { if (client && client->isConnected()) client->disconnect(); connected = false; }
++    else if (dt > 40) {
++      if (scr == S_MAIN) nextPage(1);
++      else goBack();
++    }
++  }
++  wasDown = down;
++}
++
++// Один «тик» интерфейса: кнопка, тач, подсветка, перерисовка. Зовётся и из долгих ожиданий BLE.
++void uiTick() {
++  static uint32_t lastDraw = 0;
++  handleButton();
++  handleTouch();
++  housekeeping();
++  uint32_t now = millis();
++  if (now - lastDraw >= 90) { lastDraw = now; drawUi(); }
++}
++
++void idleWait(uint32_t ms) {
++  uint32_t t = millis();
++  while (millis() - t < ms) { uiTick(); delay(4); }
++}
++
+ // ---------- BLE ----------
+ class ClientCB : public NimBLEClientCallbacks {
+   void onDisconnect(NimBLEClient*) override {
+@@ -867,12 +1675,17 @@ bool scanAndConnect() {
+   drawUi();
+   NimBLEScan* sc = NimBLEDevice::getScan();
+   sc->setActiveScan(true);
+-  NimBLEScanResults r = sc->start(4, false);
++  sc->clearResults();
++  // Скан не блокирует цикл: пока он идёт, интерфейс и тач продолжают работать.
++  sc->start(4, nullptr, false);
++  uint32_t t0 = millis();
++  while (sc->isScanning() && millis() - t0 < 6000) { uiTick(); delay(4); }
++  NimBLEScanResults r = sc->getResults();
+   NimBLEAddress best; bool found = false; int bestRssi = -999; String bestName;
+-  for (auto it = r.begin(); it != r.end(); ++it) {
+-    NimBLEAdvertisedDevice* a = *it;
+-    if (!nameMatches(a->getName())) continue;
+-    if (a->getRSSI() > bestRssi) { bestRssi = a->getRSSI(); best = a->getAddress(); bestName = a->getName().c_str(); found = true; }
++  for (int i = 0; i < r.getCount(); i++) {
++    NimBLEAdvertisedDevice a = r.getDevice(i);
++    if (!nameMatches(a.getName())) continue;
++    if (a.getRSSI() > bestRssi) { bestRssi = a.getRSSI(); best = a.getAddress(); bestName = a.getName().c_str(); found = true; }
+   }
+   sc->clearResults();
+   if (!found) { statusNow("not found", COL_BAD); return false; }
+@@ -894,7 +1707,7 @@ bool scanAndConnect() {
+   rxLen = 0; rxExpected = 0; lastRx = millis(); connected = true; d.valid = 0;
+   txCounter = 0; rxCounter = 0; pressPowerRequired = false;
+   authState = AUTH_WAIT_INIT; pendingTx = TX_INIT; authLastSend = millis();
+-  d.totalLow = 0; d.totalHigh = 0; d.tripKm = 0;
++  d.totalLow = 0; d.totalHigh = 0; d.tripKm = 0; sessionMax = 0;
+   memset(d.serial, 0, sizeof(d.serial)); d.fw = 0;
+   status("AUTH INIT", COL_ACCENT);
+   return true;
+@@ -904,36 +1717,35 @@ bool scanAndConnect() {
+ void setup() {
+   Serial.begin(115200);
+   pinMode(BTN_PIN, INPUT_PULLUP);
++  loadSettings();
++  applyTheme();
+   tft.init();
+-  tft.setRotation(0);  // портретная ориентация, 240x320
++  tft.setRotation(cfg.flip ? 2 : 0);   // портрет 240x320 (0 или 180°)
++  ledcSetup(BL_CH, 5000, 8);
++  ledcAttachPin(BL_PIN, BL_CH);
++  setBacklight(cfg.bright);
++  touchSPI.begin(TOUCH_CLK, TOUCH_MISO, TOUCH_MOSI, TOUCH_CS);
++  ts.begin(touchSPI);
++  ts.setRotation(0);
++  if (!cfg.cal.valid) { scr = S_CAL; calStep = 0; calFromBoot = true; }   // первый запуск: калибровка
+   tft.fillScreen(COL_BG);
+   clearCache();
++  lastAct = millis();
+   drawUi();
+   NimBLEDevice::init("");
+   NimBLEDevice::setPower(ESP_PWR_LVL_P9);
+   Serial.println("Ninebot G30/ES4 dashboard; encrypted handshake required");
+ }
+ 
+-void handleButton() {
+-  static uint32_t downAt = 0;
+-  static bool wasDown = false;
+-  bool down = digitalRead(BTN_PIN) == LOW;
+-  if (down && !wasDown) downAt = millis();
+-  if (!down && wasDown) {
+-    uint32_t dt = millis() - downAt;
+-    if (dt > 1500) { if (client && client->isConnected()) client->disconnect(); connected = false; }
+-    else if (dt > 40) { page = (page + 1) % 3; }
+-  }
+-  wasDown = down;
+-}
+-
+ void loop() {
+   static uint32_t lastPoll = 0, lastDraw = 0;
+   static int idx = 0;
+   handleButton();
++  handleTouch();
++  housekeeping();
+ 
+   if (!connected) {
+-    if (!scanAndConnect()) { drawUi(); delay(1500); return; }
++    if (!scanAndConnect()) { drawUi(); idleWait(1500); return; }
+   }
+ 
+   uint32_t now = millis();
+diff --git a/src/ru_fonts.h b/src/ru_fonts.h
+new file mode 100644
+index 0000000..a1648e8
+--- /dev/null
++++ b/src/ru_fonts.h
+@@ -0,0 +1,3625 @@
++// Сгенерировано tools/gen_ru_font.py. Не править вручную.
++// Шрифты: латиница + кириллица (Ё, А-я, ё) для TFT_eSPI (формат GFX). Исходник: DejaVu Sans (Bitstream Vera licence).
++#pragma once
++#include <TFT_eSPI.h>
++
++// RU1: DejaVu Sans Condensed 10px, 1-bit
++static const uint8_t RU1_bmp[] PROGMEM = {
++  0x44,0x44,0x40,0x40,0x66,0x00,0x00,0x00,0x14,0x14,0x7E,0x28,0x7C,0x28,0x50,0x00,
++  0x00,0x87,0x98,0x70,0xA2,0x9C,0x00,0x00,0xE4,0x4A,0x2A,0x09,0x41,0x51,0x28,0x9C,
++  0x00,0x00,0x00,0x78,0x80,0x82,0x85,0xC9,0x9F,0x00,0x00,0x50,0x00,0x24,0x44,0x44,
++  0x44,0x40,0x04,0x42,0x22,0x24,0x40,0xA3,0x9C,0x40,0x00,0x00,0x10,0x10,0x7E,0x10,
++  0x10,0x10,0x00,0x48,0x00,0xE0,0x00,0x40,0x22,0x44,0x48,0x88,0x00,0x79,0x24,0x92,
++  0x49,0x27,0x00,0x00,0x60,0x82,0x08,0x20,0x87,0x80,0x70,0x20,0x84,0x21,0x07,0x80,
++  0x78,0x21,0x8C,0x08,0x27,0x00,0x00,0x10,0xC5,0x14,0xF8,0x41,0x00,0x71,0x07,0x02,
++  0x08,0x27,0x00,0x00,0x79,0x07,0x12,0x49,0x27,0x80,0x00,0x78,0x41,0x04,0x20,0x82,
++  0x00,0x79,0x24,0x9E,0x49,0x27,0x80,0x00,0x71,0x24,0x92,0x38,0x27,0x00,0x00,0x40,
++  0x04,0x00,0x40,0x04,0x80,0x02,0x1C,0x60,0x30,0x0C,0x02,0x7E,0x00,0x7E,0x00,0x00,
++  0x40,0x30,0x0E,0x0C,0x70,0x00,0x70,0x84,0x42,0x00,0x80,0x1E,0x30,0x96,0x4A,0xA6,
++  0x52,0xA9,0x28,0x44,0x1C,0x00,0x00,0x30,0x61,0x22,0x47,0x90,0xA1,0x00,0x79,0x24,
++  0x9E,0x49,0x27,0x80,0x7D,0x04,0x10,0x41,0x03,0xC0,0x00,0x78,0x89,0x12,0x24,0x48,
++  0x9E,0x00,0x79,0x04,0x1E,0x41,0x07,0x80,0x7A,0x10,0xE4,0x21,0x00,0x7C,0x81,0x02,
++  0x64,0x48,0x8F,0x00,0x00,0x44,0x89,0x13,0xE4,0x48,0x91,0x00,0x49,0x24,0x90,0x44,
++  0x44,0x44,0x44,0x80,0x48,0xA1,0x83,0x05,0x09,0x13,0x00,0x42,0x10,0x84,0x21,0xE0,
++  0x46,0x66,0x6A,0x6A,0x5A,0x52,0x42,0x00,0x44,0xC9,0x92,0xA5,0x49,0x93,0x00,0x7C,
++  0x89,0x0A,0x14,0x48,0x8E,0x00,0x00,0x79,0x24,0x9E,0x41,0x04,0x00,0x7C,0x89,0x0A,
++  0x14,0x48,0x8E,0x04,0x00,0x00,0x79,0x24,0x9C,0x49,0x24,0x40,0x79,0x04,0x0E,0x08,
++  0x27,0x80,0x00,0xFC,0x40,0x81,0x02,0x04,0x08,0x00,0x44,0x89,0x12,0x24,0x48,0x9E,
++  0x00,0x00,0x84,0x91,0x22,0x43,0x06,0x0C,0x00,0x89,0x2C,0x95,0x4A,0xA5,0x53,0x10,
++  0x88,0x00,0x48,0xA3,0x0C,0x31,0x24,0x40,0x88,0xA0,0xC1,0x02,0x04,0x08,0x00,0x7C,
++  0x21,0x08,0x21,0x0F,0xC0,0x64,0x44,0x44,0x44,0x40,0x88,0x44,0x44,0x22,0x00,0x62,
++  0x22,0x22,0x22,0x60,0x18,0x64,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x0F,0x00,0x41,
++  0x00,0x00,0x00,0x00,0x21,0x40,0x9E,0x49,0xE0,0x00,0x41,0x05,0x1A,0x49,0x24,0x9E,
++  0x00,0x32,0x21,0x04,0x38,0x00,0x08,0x22,0x96,0x8A,0x24,0x9E,0x00,0x31,0x28,0xBC,
++  0x41,0xE0,0x00,0x24,0x46,0x44,0x44,0x21,0x68,0xA2,0x49,0xE0,0x9C,0x00,0x41,0x05,
++  0x1A,0x49,0x24,0x92,0x48,0x24,0x92,0x44,0x04,0x44,0x44,0x48,0x00,0x41,0x04,0x16,
++  0x61,0x85,0x12,0x49,0x24,0x92,0x12,0x36,0x92,0x49,0x24,0x92,0x48,0x11,0xA4,0x92,
++  0x49,0x20,0x21,0x68,0xA2,0x49,0xC0,0x00,0x11,0xA4,0x92,0x49,0xE4,0x10,0x00,0x21,
++  0x68,0xA2,0x49,0xE0,0x82,0x00,0x16,0x44,0x44,0x26,0x10,0x61,0x78,0x00,0x44,0x64,
++  0x44,0x60,0x01,0x24,0x92,0x49,0xE0,0x00,0x89,0x45,0x14,0x20,0x00,0x92,0xD5,0xB3,
++  0x62,0x40,0x00,0x50,0xC2,0x14,0x48,0x00,0x89,0x45,0x0C,0x20,0x84,0x00,0x00,0x71,
++  0x08,0x8F,0x00,0x18,0x82,0x08,0x20,0x82,0x08,0x20,0x60,0x49,0x24,0x92,0x48,0x00,
++  0x40,0x82,0x08,0x10,0x42,0x08,0x21,0x00,0x72,0x0C,0x00,0x00,0x50,0x07,0x90,0x41,
++  0xE4,0x10,0x78,0x00,0x30,0x61,0x22,0x47,0x90,0xA1,0x00,0x79,0x04,0x1E,0x45,0x27,
++  0x80,0x79,0x24,0x9E,0x49,0x27,0x80,0x7A,0x10,0x84,0x21,0x00,0x3C,0x48,0x91,0x22,
++  0x48,0xBF,0xC1,0x82,0x00,0x79,0x04,0x1E,0x41,0x07,0x80,0x48,0x8A,0x41,0xA0,0xF8,
++  0x29,0x12,0x28,0x88,0x00,0x78,0x20,0x8E,0x08,0x27,0x00,0x00,0x4C,0x99,0x52,0xA6,
++  0x4C,0x91,0x00,0x18,0x01,0x32,0x65,0x4A,0x99,0x32,0x44,0x00,0x4C,0xB1,0xC3,0x84,
++  0x89,0x11,0x00,0x3C,0x48,0x91,0x22,0x48,0xB1,0x00,0x46,0x66,0x6A,0x6A,0x5A,0x52,
++  0x42,0x00,0x44,0x89,0x13,0xE4,0x48,0x91,0x00,0x7C,0x89,0x0A,0x14,0x48,0x8E,0x00,
++  0x00,0x7C,0x89,0x12,0x24,0x48,0x91,0x00,0x79,0x24,0x9E,0x41,0x04,0x00,0x7D,0x04,
++  0x10,0x41,0x03,0xC0,0x00,0xFC,0x40,0x81,0x02,0x04,0x08,0x00,0x89,0x25,0x0C,0x20,
++  0x86,0x00,0x18,0x76,0x52,0x52,0x52,0x3C,0x10,0x00,0x48,0xA3,0x0C,0x31,0x24,0x40,
++  0x44,0x89,0x12,0x24,0x48,0x9F,0x81,0x02,0x00,0x49,0x24,0x9E,0x08,0x20,0x80,0x48,
++  0x92,0x24,0x89,0x22,0x48,0x92,0x27,0xF8,0x00,0x48,0x92,0x24,0x89,0x22,0x48,0x92,
++  0x27,0xF8,0x02,0x00,0x00,0x00,0xE0,0x40,0x81,0xE2,0x24,0x4F,0x00,0x42,0x42,0x42,
++  0x7A,0x46,0x4A,0x7A,0x00,0x41,0x04,0x1E,0x45,0x27,0x80,0xF8,0x20,0x5F,0x06,0x27,
++  0x80,0x00,0x4F,0x14,0x25,0x09,0xC2,0x50,0x92,0x24,0xF0,0x00,0x00,0x00,0x79,0x24,
++  0x8E,0x29,0x24,0x80,0x21,0x40,0x9E,0x49,0xE0,0x00,0x39,0x0A,0x16,0x8A,0x24,0x9C,
++  0x00,0x72,0x9C,0x97,0x00,0x72,0x10,0x84,0x00,0x38,0xA4,0x92,0xFE,0x10,0x00,0x31,
++  0x28,0xBC,0x41,0xE0,0x00,0x52,0x34,0x3C,0x52,0x92,0x00,0x60,0x84,0x61,0x38,0x00,
++  0x59,0x66,0x9A,0x48,0x00,0x08,0xC0,0x16,0x59,0xA6,0x92,0x51,0x85,0x14,0x48,0x00,
++  0x79,0x24,0x92,0xC8,0x00,0x4C,0xD9,0xD2,0xA4,0x40,0x00,0x49,0x27,0x92,0x48,0x00,
++  0x21,0x68,0xA2,0x49,0xC0,0x00,0x79,0x24,0x92,0x48,0x00,0x11,0xA4,0x92,0x49,0xE4,
++  0x10,0x00,0x32,0x21,0x04,0x38,0x00,0x71,0x08,0x42,0x00,0x89,0x45,0x0C,0x20,0x84,
++  0x00,0x00,0x10,0x34,0x5A,0x92,0x92,0x92,0x7E,0x10,0x10,0x00,0x00,0x50,0xC2,0x14,
++  0x48,0x00,0x49,0x24,0x92,0x7C,0x10,0x00,0x4A,0x5E,0x10,0x80,0x4A,0x4A,0x4A,0x4A,
++  0x7E,0x00,0x4A,0x25,0x12,0x89,0x47,0xF0,0x08,0x00,0x00,0x60,0x83,0xC9,0x38,0x00,
++  0x00,0x85,0x0B,0xD4,0xAE,0x40,0x42,0x1E,0x97,0x00,0x64,0x84,0x61,0x78,0x00,0x0C,
++  0x52,0x62,0x62,0x52,0x5C,0x00,0x7A,0x4E,0x94,0x80,0x28,0x03,0x12,0x8B,0xC4,0x1E,
++  0x00,
++};
++static const GFXglyph RU1_glyph[] PROGMEM = {
++  {0,0,0,3,0,0},
++  {0,4,8,4,0,-8},
++  {4,4,8,4,0,-8},
++  {8,8,8,8,0,-8},
++  {16,6,10,6,0,-8},
++  {24,9,9,9,0,-8},
++  {35,7,9,7,0,-8},
++  {43,2,8,2,0,-8},
++  {45,4,10,4,0,-8},
++  {50,4,10,4,0,-8},
++  {55,5,8,5,0,-8},
++  {60,8,7,8,0,-7},
++  {67,3,4,3,0,-2},
++  {69,3,4,3,0,-4},
++  {71,3,2,3,0,-2},
++  {72,4,9,3,0,-8},
++  {77,6,9,6,0,-8},
++  {84,6,8,6,0,-8},
++  {90,6,8,6,0,-8},
++  {96,6,9,6,0,-8},
++  {103,6,8,6,0,-8},
++  {109,6,9,6,0,-8},
++  {116,6,9,6,0,-8},
++  {123,6,8,6,0,-8},
++  {129,6,9,6,0,-8},
++  {136,6,9,6,0,-8},
++  {143,3,6,3,0,-6},
++  {146,3,8,3,0,-6},
++  {149,8,6,8,0,-6},
++  {155,8,5,8,0,-5},
++  {160,8,6,8,0,-6},
++  {166,5,8,5,0,-8},
++  {171,9,10,9,0,-8},
++  {183,7,8,6,0,-8},
++  {190,6,8,6,0,-8},
++  {196,6,9,6,0,-8},
++  {203,7,8,7,0,-8},
++  {210,6,8,6,0,-8},
++  {216,5,8,5,0,-8},
++  {221,7,9,7,0,-8},
++  {229,7,8,7,0,-8},
++  {236,3,8,3,0,-8},
++  {239,4,10,3,-1,-8},
++  {244,7,8,6,0,-8},
++  {251,5,8,5,0,-8},
++  {256,8,8,8,0,-8},
++  {264,7,8,7,0,-8},
++  {271,7,9,7,0,-8},
++  {279,6,8,5,0,-8},
++  {285,7,10,7,0,-8},
++  {294,6,8,6,0,-8},
++  {300,6,9,6,0,-8},
++  {307,7,8,5,-1,-8},
++  {314,7,9,7,0,-8},
++  {322,7,8,6,0,-8},
++  {329,9,8,9,0,-8},
++  {338,6,8,6,0,-8},
++  {344,7,8,5,-1,-8},
++  {351,6,8,6,0,-8},
++  {357,4,10,4,0,-8},
++  {362,4,9,3,0,-8},
++  {367,4,10,4,0,-8},
++  {372,8,8,8,0,-8},
++  {380,6,3,5,-1,0},
++  {383,5,8,5,0,-8},
++  {388,6,7,6,0,-6},
++  {394,6,9,6,0,-8},
++  {401,5,7,5,0,-6},
++  {406,6,9,6,0,-8},
++  {413,6,7,6,0,-6},
++  {419,4,8,3,0,-8},
++  {423,6,9,6,0,-6},
++  {430,6,8,6,0,-8},
++  {436,3,8,3,0,-8},
++  {439,4,11,3,-1,-8},
++  {445,6,8,5,0,-8},
++  {451,3,8,3,0,-8},
++  {454,9,6,9,0,-6},
++  {461,6,6,6,0,-6},
++  {466,6,7,6,0,-6},
++  {472,6,9,6,0,-6},
++  {479,6,9,6,0,-6},
++  {486,4,6,4,0,-6},
++  {489,5,7,5,0,-6},
++  {494,4,8,4,0,-8},
++  {498,6,7,6,0,-6},
++  {504,6,6,5,0,-6},
++  {509,7,6,7,0,-6},
++  {515,6,6,5,0,-6},
++  {520,6,9,5,0,-6},
++  {527,5,6,5,0,-6},
++  {531,6,10,6,0,-8},
++  {539,3,11,3,0,-8},
++  {544,6,10,6,0,-8},
++  {552,8,4,8,0,-4},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {556,6,10,6,0,-10},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {564,7,8,6,0,-8},
++  {571,6,8,6,0,-8},
++  {577,6,8,6,0,-8},
++  {583,5,8,5,0,-8},
++  {588,7,10,7,0,-8},
++  {597,6,8,6,0,-8},
++  {603,10,8,10,0,-8},
++  {613,6,9,6,0,-8},
++  {620,7,8,7,0,-8},
++  {627,7,10,7,0,-10},
++  {636,7,8,6,0,-8},
++  {643,7,8,7,0,-8},
++  {650,8,8,8,0,-8},
++  {658,7,8,7,0,-8},
++  {665,7,9,7,0,-8},
++  {673,7,8,7,0,-8},
++  {680,6,8,5,0,-8},
++  {686,6,9,6,0,-8},
++  {693,7,8,5,-1,-8},
++  {700,6,8,5,0,-8},
++  {706,8,8,8,0,-8},
++  {714,6,8,6,0,-8},
++  {720,7,10,7,0,-8},
++  {729,6,8,6,0,-8},
++  {735,10,8,10,0,-8},
++  {745,10,10,10,0,-8},
++  {758,7,8,7,0,-8},
++  {765,8,8,8,0,-8},
++  {773,6,8,6,0,-8},
++  {779,6,9,6,0,-8},
++  {786,10,9,10,0,-8},
++  {798,6,8,6,0,-8},
++  {804,6,7,6,0,-6},
++  {810,6,9,6,0,-8},
++  {817,5,6,5,0,-6},
++  {821,5,6,5,0,-6},
++  {825,6,8,6,0,-6},
++  {831,6,7,6,0,-6},
++  {837,8,6,8,0,-6},
++  {843,5,7,5,0,-6},
++  {848,6,6,6,0,-6},
++  {853,6,8,6,0,-8},
++  {859,6,6,5,0,-6},
++  {864,6,6,6,0,-6},
++  {869,7,6,7,0,-6},
++  {875,6,6,6,0,-6},
++  {880,6,7,6,0,-6},
++  {886,6,6,6,0,-6},
++  {891,6,9,6,0,-6},
++  {898,5,7,5,0,-6},
++  {903,5,6,5,0,-6},
++  {907,6,9,5,0,-6},
++  {914,8,11,8,0,-8},
++  {925,6,6,5,0,-6},
++  {930,6,8,6,0,-6},
++  {936,5,6,5,0,-6},
++  {940,8,6,8,0,-6},
++  {946,9,8,8,0,-6},
++  {955,6,6,6,0,-6},
++  {960,7,6,7,0,-6},
++  {966,5,6,5,0,-6},
++  {970,5,7,5,0,-6},
++  {975,8,7,8,0,-6},
++  {982,5,6,5,0,-6},
++  {0,0,0,0,0,0},
++  {986,6,9,6,0,-8},
++};
++static const GFXfont RU1 PROGMEM = {(uint8_t*)RU1_bmp,(GFXglyph*)RU1_glyph,0x20,0x451,13};
++
++// RU2: DejaVu Sans Condensed 13px, 1-bit
++static const uint8_t RU2_bmp[] PROGMEM = {
++  0x21,0x08,0x42,0x10,0x04,0x20,0x00,0x52,0x94,0x00,0x00,0x00,0x00,0x00,0x09,0x02,
++  0x83,0xF8,0x48,0x12,0x1F,0xC1,0x40,0x90,0x24,0x00,0x00,0x10,0x21,0xF2,0x85,0x07,
++  0x05,0x0A,0x14,0xF8,0x40,0x80,0x20,0x8A,0x21,0x24,0x25,0x05,0x40,0x4B,0x82,0x50,
++  0x52,0x11,0x42,0x38,0x00,0x00,0x18,0x12,0x08,0x04,0x03,0x02,0xC9,0x34,0x8E,0x42,
++  0x1E,0x80,0x00,0x49,0x00,0x00,0x00,0x01,0x08,0x84,0x21,0x08,0x41,0x08,0x20,0x41,
++  0x08,0x42,0x18,0xC4,0x21,0x10,0x80,0x00,0x86,0x8C,0xE8,0x80,0x00,0x00,0x00,0x08,
++  0x02,0x00,0x81,0xFE,0x08,0x02,0x00,0x80,0x20,0x00,0x00,0x66,0x44,0x70,0x00,0x00,
++  0x44,0x12,0x22,0x24,0x44,0x88,0x00,0x18,0x59,0x12,0x34,0x68,0x51,0xA2,0x64,0x70,
++  0x00,0x70,0x20,0x40,0x81,0x02,0x04,0x08,0x7C,0x00,0x30,0xD8,0x10,0x20,0x41,0x04,
++  0x18,0x60,0xF8,0x38,0xD8,0x10,0x23,0xC1,0x81,0x02,0x04,0xF8,0x00,0x0C,0x38,0xB1,
++  0x64,0xC9,0x9F,0x86,0x0C,0x00,0x7C,0x81,0x03,0xC0,0x40,0x81,0x02,0x78,0x00,0x00,
++  0x18,0x69,0x82,0x07,0xCC,0x90,0xA1,0x64,0x78,0x00,0x7C,0x08,0x30,0x40,0x83,0x04,
++  0x08,0x30,0x00,0x18,0xD9,0x12,0x23,0xC7,0x91,0xA3,0x44,0x78,0x00,0x18,0xD9,0x12,
++  0x24,0x6C,0xCF,0x82,0x04,0xF0,0x00,0x66,0x00,0x06,0x60,0x66,0x00,0x06,0x64,0x40,
++  0x00,0x80,0xE1,0xC1,0xC0,0x70,0x03,0x80,0x38,0x00,0x7F,0x80,0x00,0x01,0xFE,0x00,
++  0x00,0x00,0x00,0x1C,0x00,0xC0,0x0E,0x03,0x07,0x06,0x00,0x00,0x31,0x60,0x82,0x10,
++  0xC2,0x00,0x20,0x80,0x0F,0x03,0x0C,0x20,0x44,0xF2,0x49,0x25,0x12,0x51,0x24,0xFC,
++  0x40,0x02,0x08,0x1F,0x80,0x00,0x00,0x00,0x18,0x18,0x24,0x24,0x24,0x7E,0x7E,0x42,
++  0x81,0x00,0x7C,0x42,0x42,0x7C,0x46,0x42,0x42,0x42,0x7C,0x00,0x0C,0x33,0x61,0x40,
++  0x40,0x40,0x40,0x40,0x61,0x3E,0x00,0x7E,0x21,0x90,0x48,0x24,0x12,0x09,0x04,0x84,
++  0x7C,0x00,0x00,0x7E,0x81,0x03,0xE4,0x08,0x10,0x20,0x7E,0x00,0x7C,0x81,0x03,0xE4,
++  0x08,0x10,0x20,0x40,0x00,0x0C,0x19,0x98,0x08,0x04,0x02,0x39,0x04,0x82,0x61,0x1F,
++  0x80,0x00,0x43,0x21,0x90,0xCF,0xE4,0x32,0x19,0x0C,0x86,0x43,0x00,0x00,0x49,0x24,
++  0x92,0x40,0x22,0x22,0x22,0x22,0x22,0x6C,0x00,0x46,0x4C,0x58,0x70,0x70,0x58,0x4C,
++  0x46,0x42,0x00,0x40,0x81,0x02,0x04,0x08,0x10,0x20,0x7C,0x00,0x61,0x94,0x65,0x29,
++  0x4A,0x4A,0x93,0x24,0xC9,0x02,0x40,0x80,0x00,0x63,0x39,0x94,0xCB,0x64,0xB2,0x79,
++  0x1C,0x8E,0x43,0x00,0x00,0x1C,0x1B,0x18,0x48,0x24,0x1A,0x0D,0x04,0x82,0x63,0x1F,
++  0x00,0x00,0x7C,0x8D,0x1A,0x27,0xC8,0x10,0x20,0x40,0x00,0x1C,0x1B,0x18,0x48,0x24,
++  0x1A,0x0D,0x04,0x82,0x63,0x1F,0x01,0x80,0x60,0x7C,0x46,0x46,0x44,0x78,0x44,0x46,
++  0x42,0x43,0x00,0x18,0xC9,0x02,0x07,0x03,0x81,0x81,0x06,0xF8,0x00,0xFE,0x08,0x04,
++  0x02,0x01,0x00,0x80,0x40,0x20,0x10,0x00,0x00,0x43,0x21,0x90,0xC8,0x64,0x32,0x19,
++  0x08,0xC4,0x3C,0x00,0x00,0x00,0xC3,0x42,0x42,0x66,0x24,0x24,0x3C,0x18,0x18,0x00,
++  0x46,0x24,0x62,0x4A,0x64,0xA4,0x29,0x42,0x94,0x29,0xC3,0x18,0x31,0x80,0x00,0x62,
++  0x24,0x1C,0x18,0x18,0x3C,0x24,0x42,0x42,0x00,0xC6,0x22,0x0A,0x07,0x01,0x00,0x80,
++  0x40,0x20,0x10,0x00,0x00,0x7E,0x06,0x04,0x08,0x10,0x30,0x20,0x40,0x7E,0x00,0x62,
++  0x10,0x84,0x21,0x08,0x42,0x10,0xC0,0x84,0x44,0x42,0x22,0x21,0x00,0x71,0x8C,0x63,
++  0x18,0xC6,0x31,0x8C,0xE0,0x1C,0x04,0x82,0x10,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
++  0x00,0x00,0x00,0x03,0xF0,0x00,0x60,0x80,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x78,
++  0x08,0x13,0xE4,0x48,0x9F,0x00,0x00,0x40,0x81,0x03,0xE6,0x48,0x50,0xA1,0x64,0xB8,
++  0x00,0x3D,0x04,0x10,0x41,0x03,0xC0,0x00,0x04,0x08,0x11,0xE4,0x48,0x91,0x22,0x44,
++  0x78,0x00,0x3C,0x89,0x0B,0xF4,0x08,0x0F,0x00,0x00,0x32,0x11,0xE4,0x21,0x08,0x42,
++  0x00,0x3C,0x89,0x12,0x24,0x48,0x8F,0x02,0x4C,0x70,0x00,0x40,0x81,0x03,0xE4,0x48,
++  0x91,0x22,0x44,0x88,0x48,0x24,0x92,0x48,0x44,0x04,0x44,0x44,0x44,0x44,0x80,0x40,
++  0x81,0x02,0x24,0x8A,0x18,0x28,0x48,0x88,0x49,0x24,0x92,0x48,0x7D,0xC8,0xC9,0x11,
++  0x22,0x24,0x44,0x88,0x91,0x10,0x00,0x7C,0x89,0x12,0x24,0x48,0x91,0x00,0x3C,0x89,
++  0x12,0x34,0x48,0x8E,0x00,0x00,0x7C,0xC9,0x0A,0x14,0x2C,0x97,0x20,0x40,0x80,0x00,
++  0x3C,0x89,0x12,0x24,0x48,0x8F,0x02,0x04,0x08,0x00,0x7B,0x10,0x84,0x21,0x00,0x79,
++  0x04,0x0E,0x08,0x27,0x80,0x00,0x42,0x3C,0x84,0x21,0x08,0x30,0x00,0x44,0x89,0x12,
++  0x24,0x48,0x8F,0x00,0x00,0x44,0x89,0x11,0x42,0x85,0x04,0x00,0x4C,0x93,0x25,0x51,
++  0x54,0x35,0x0C,0xC3,0x30,0x00,0x44,0x50,0xE0,0x82,0x8D,0x91,0x00,0x44,0x89,0x11,
++  0x42,0x87,0x04,0x08,0x20,0xC0,0x00,0x7C,0x21,0x0C,0x21,0x0F,0xC0,0x0C,0x20,0x40,
++  0x81,0x02,0x1C,0x08,0x10,0x20,0x40,0x60,0x00,0x44,0x44,0x44,0x44,0x44,0x44,0x40,
++  0x70,0x20,0x40,0x81,0x03,0x03,0x08,0x10,0x20,0x43,0x80,0x00,0x38,0x91,0xC0,0x00,
++  0x00,0x00,0x00,0x00,0x34,0x68,0x03,0xF4,0x08,0x1F,0x20,0x40,0x81,0x03,0xF0,0x18,
++  0x18,0x24,0x24,0x24,0x7E,0x7E,0x42,0x81,0x00,0x7E,0x40,0x40,0x78,0x46,0x42,0x42,
++  0x42,0x7C,0x00,0x7C,0x42,0x42,0x7C,0x46,0x42,0x42,0x42,0x7C,0x00,0x7C,0x81,0x02,
++  0x04,0x08,0x10,0x20,0x40,0x00,0x1F,0x09,0x8C,0xC6,0x63,0x31,0x18,0x8C,0x46,0x7F,
++  0xA0,0x50,0x20,0x00,0x00,0x7E,0x81,0x03,0xE4,0x08,0x10,0x20,0x7E,0x00,0x62,0x31,
++  0x13,0x04,0xB0,0x37,0x01,0x74,0x13,0x20,0x88,0x88,0x46,0x42,0x10,0x00,0x00,0x38,
++  0x4C,0x06,0x04,0x3C,0x0C,0x06,0x02,0x04,0x7C,0x00,0x43,0x23,0x91,0xC9,0x64,0xB2,
++  0x99,0x4C,0xC6,0x63,0x00,0x00,0x24,0x0C,0x00,0x08,0x64,0x72,0x39,0x2C,0x96,0x53,
++  0x29,0x98,0xCC,0x60,0x42,0x22,0x12,0x0B,0x07,0x83,0x21,0x18,0x84,0x41,0x00,0x00,
++  0x1F,0x09,0x84,0xC2,0x63,0x31,0x18,0x8C,0xC6,0xC3,0x00,0x00,0x61,0x94,0x65,0x29,
++  0x4A,0x4A,0x93,0x24,0xC9,0x02,0x40,0x80,0x00,0x43,0x21,0x90,0xCF,0xE4,0x32,0x19,
++  0x0C,0x86,0x43,0x00,0x00,0x1C,0x1B,0x18,0x48,0x24,0x1A,0x0D,0x04,0x82,0x63,0x1F,
++  0x00,0x00,0x7F,0x21,0x90,0xC8,0x64,0x32,0x19,0x0C,0x86,0x43,0x00,0x00,0x7C,0x8D,
++  0x1A,0x27,0xC8,0x10,0x20,0x40,0x00,0x0C,0x33,0x61,0x40,0x40,0x40,0x40,0x40,0x61,
++  0x3E,0x00,0xFE,0x08,0x04,0x02,0x01,0x00,0x80,0x40,0x20,0x10,0x00,0x00,0x46,0x89,
++  0x91,0x42,0x87,0x04,0x08,0x60,0x00,0x0C,0x0F,0xC4,0xC9,0x32,0x4C,0x93,0x26,0xD8,
++  0x78,0x0C,0x00,0x00,0x62,0x24,0x1C,0x18,0x18,0x3C,0x24,0x42,0x42,0x00,0x43,0x21,
++  0x90,0xC8,0x64,0x32,0x19,0x0C,0x86,0x7F,0x80,0x40,0x20,0x00,0x00,0x42,0x42,0x42,
++  0x42,0x3E,0x02,0x02,0x02,0x02,0x00,0x42,0x22,0x11,0x10,0x88,0x84,0x44,0x22,0x21,
++  0x11,0x08,0x88,0x44,0x7F,0xE0,0x00,0x00,0x42,0x22,0x11,0x10,0x88,0x84,0x44,0x22,
++  0x21,0x11,0x08,0x88,0x44,0x7F,0xF0,0x00,0x80,0x04,0x00,0x00,0x00,0x00,0xF0,0x04,
++  0x01,0x00,0x78,0x13,0x04,0x21,0x08,0x46,0x1F,0x00,0x00,0x40,0x90,0x24,0x09,0xE2,
++  0x46,0x90,0xA4,0x29,0x0A,0x7C,0x80,0x00,0x40,0x40,0x40,0x78,0x46,0x42,0x42,0x42,
++  0x7C,0x00,0x38,0x6C,0x02,0x02,0x02,0x3F,0x02,0x02,0x46,0x7C,0x00,0x01,0x82,0x33,
++  0x11,0x08,0x98,0x24,0x81,0x3C,0x09,0x20,0x49,0x86,0x44,0x22,0x1E,0x00,0x00,0x3E,
++  0x42,0x42,0x62,0x3E,0x12,0x22,0x22,0x42,0x00,0x78,0x08,0x13,0xE4,0x48,0x9F,0x00,
++  0x00,0x3C,0xC1,0x03,0xE4,0x48,0xD1,0xA2,0x44,0x78,0x00,0x00,0x78,0x89,0x13,0xC4,
++  0x48,0x9F,0x00,0x7D,0x04,0x10,0x41,0x04,0x00,0x3E,0x22,0x22,0x22,0x22,0x22,0x7E,
++  0x42,0x00,0x00,0x3C,0x89,0x0B,0xF4,0x08,0x0F,0x00,0x00,0x44,0x84,0xA0,0x5C,0x0F,
++  0x82,0x48,0x89,0x11,0x10,0x00,0x78,0x20,0x8E,0x08,0x27,0x80,0x00,0x46,0x4E,0x4E,
++  0x56,0x56,0x66,0x66,0x00,0x24,0x18,0x00,0x46,0x4E,0x4E,0x56,0x56,0x66,0x66,0x00,
++  0x44,0x91,0x43,0x84,0x88,0x91,0x00,0x3E,0x4C,0x99,0x32,0x64,0xF1,0x80,0x63,0x31,
++  0x95,0x4A,0xA5,0x92,0x49,0x04,0x00,0x42,0x42,0x42,0x7E,0x42,0x42,0x42,0x00,0x3C,
++  0x89,0x12,0x34,0x48,0x8E,0x00,0x00,0x7E,0x42,0x42,0x42,0x42,0x42,0x42,0x00,0x7C,
++  0xC9,0x0A,0x14,0x2C,0x97,0x20,0x40,0x80,0x00,0x3D,0x04,0x10,0x41,0x03,0xC0,0x00,
++  0xFC,0x20,0x40,0x81,0x02,0x04,0x00,0x44,0x89,0x11,0x42,0x87,0x04,0x08,0x20,0xC0,
++  0x00,0x0C,0x03,0x07,0xF9,0x32,0x4C,0x93,0x24,0xC9,0x32,0x3F,0x03,0x00,0xC0,0x30,
++  0x00,0x00,0x44,0x50,0xE0,0x82,0x8D,0x91,0x00,0x42,0x42,0x42,0x42,0x42,0x42,0x7E,
++  0x02,0x00,0x00,0x44,0x89,0x13,0xE0,0x40,0x81,0x00,0x44,0x48,0x89,0x11,0x22,0x24,
++  0x44,0x88,0x9F,0xF0,0x00,0x44,0x48,0x89,0x11,0x22,0x24,0x44,0x88,0x9F,0xF0,0x02,
++  0x00,0x00,0x00,0xE0,0x20,0x20,0x3E,0x23,0x23,0x3E,0x00,0x41,0x20,0x90,0x4F,0xA4,
++  0x52,0x29,0xF4,0x00,0x40,0x81,0x03,0xE4,0x48,0x9F,0x00,0x78,0x20,0x5F,0x0C,0x27,
++  0x80,0x00,0x4F,0x12,0x25,0x89,0xC2,0x58,0x92,0x24,0xF0,0x00,0x00,0x00,0x3C,0x89,
++  0x11,0xE2,0x44,0x91,0x00,0x2C,0x00,0x01,0xE4,0x48,0x5F,0xA0,0x40,0x78,0x00,
++};
++static const GFXglyph RU2_glyph[] PROGMEM = {
++  {0,0,0,4,0,0},
++  {0,5,10,5,0,-10},
++  {7,5,10,5,0,-10},
++  {14,10,10,10,0,-10},
++  {27,7,12,7,0,-10},
++  {38,11,11,11,0,-10},
++  {54,9,11,9,0,-10},
++  {67,3,10,3,0,-10},
++  {71,5,12,5,0,-10},
++  {79,5,12,5,0,-10},
++  {87,6,10,6,0,-10},
++  {95,10,9,10,0,-9},
++  {107,4,4,4,0,-2},
++  {109,4,5,4,0,-5},
++  {112,4,2,4,0,-2},
++  {113,4,12,4,0,-10},
++  {119,7,11,7,0,-10},
++  {129,7,10,7,0,-10},
++  {138,7,10,7,0,-10},
++  {147,7,11,7,0,-10},
++  {157,7,10,7,0,-10},
++  {166,7,11,7,0,-10},
++  {176,7,11,7,0,-10},
++  {186,7,10,7,0,-10},
++  {195,7,11,7,0,-10},
++  {205,7,11,7,0,-10},
++  {215,4,7,4,0,-7},
++  {219,4,9,4,0,-7},
++  {224,10,8,10,0,-8},
++  {234,10,6,10,0,-6},
++  {242,10,8,10,0,-8},
++  {252,6,10,6,0,-10},
++  {260,12,13,12,0,-10},
++  {280,8,10,8,0,-10},
++  {290,8,10,8,0,-10},
++  {300,8,11,8,0,-10},
++  {311,9,10,9,0,-10},
++  {323,7,10,7,0,-10},
++  {332,7,10,7,0,-10},
++  {341,9,11,9,0,-10},
++  {354,9,10,9,0,-10},
++  {366,3,10,3,0,-10},
++  {370,4,13,3,-1,-10},
++  {377,8,10,8,0,-10},
++  {387,7,10,7,0,-10},
++  {396,10,10,10,0,-10},
++  {409,9,10,9,0,-10},
++  {421,9,11,9,0,-10},
++  {434,7,10,7,0,-10},
++  {443,9,12,9,0,-10},
++  {457,8,10,8,0,-10},
++  {467,7,11,7,0,-10},
++  {477,9,10,7,-1,-10},
++  {489,9,11,9,0,-10},
++  {502,8,10,8,0,-10},
++  {512,12,10,12,0,-10},
++  {527,8,10,8,0,-10},
++  {537,9,10,7,-1,-10},
++  {549,8,10,8,0,-10},
++  {559,5,12,5,0,-10},
++  {567,4,12,4,0,-10},
++  {573,5,12,5,0,-10},
++  {581,10,10,10,0,-10},
++  {594,7,4,6,-1,0},
++  {598,6,11,6,0,-11},
++  {607,7,9,7,0,-8},
++  {615,7,11,7,0,-10},
++  {625,6,9,6,0,-8},
++  {632,7,11,7,0,-10},
++  {642,7,9,7,0,-8},
++  {650,5,10,4,0,-10},
++  {657,7,11,7,0,-8},
++  {667,7,10,7,0,-10},
++  {676,3,10,3,0,-10},
++  {680,4,13,3,-1,-10},
++  {687,7,10,7,0,-10},
++  {696,3,10,3,0,-10},
++  {700,11,8,11,0,-8},
++  {711,7,8,7,0,-8},
++  {718,7,9,7,0,-8},
++  {726,7,11,7,0,-8},
++  {736,7,11,7,0,-8},
++  {746,5,8,5,0,-8},
++  {751,6,9,6,0,-8},
++  {758,5,10,5,0,-10},
++  {765,7,9,7,0,-8},
++  {773,7,8,7,0,-8},
++  {780,10,8,10,0,-8},
++  {790,7,8,7,0,-8},
++  {797,7,11,7,0,-8},
++  {807,6,8,6,0,-8},
++  {813,7,13,7,0,-10},
++  {825,4,14,4,0,-10},
++  {832,7,13,7,0,-10},
++  {844,10,6,10,0,-6},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {852,7,12,7,0,-12},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {863,8,10,8,0,-10},
++  {873,8,10,8,0,-10},
++  {883,8,10,8,0,-10},
++  {893,7,10,7,0,-10},
++  {902,9,13,9,0,-10},
++  {917,7,10,7,0,-10},
++  {926,13,10,13,0,-10},
++  {943,8,11,8,0,-10},
++  {954,9,10,9,0,-10},
++  {966,9,12,9,0,-12},
++  {980,9,10,8,0,-10},
++  {992,9,10,9,0,-10},
++  {1004,10,10,10,0,-10},
++  {1017,9,10,9,0,-10},
++  {1029,9,11,9,0,-10},
++  {1042,9,10,9,0,-10},
++  {1054,7,10,7,0,-10},
++  {1063,8,11,8,0,-10},
++  {1074,9,10,7,-1,-10},
++  {1086,7,10,7,0,-10},
++  {1095,10,10,10,0,-10},
++  {1108,8,10,8,0,-10},
++  {1118,9,13,9,0,-10},
++  {1133,8,10,8,0,-10},
++  {1143,13,10,13,0,-10},
++  {1160,13,13,13,0,-10},
++  {1182,10,10,10,0,-10},
++  {1195,10,10,10,0,-10},
++  {1208,8,10,8,0,-10},
++  {1218,8,11,8,0,-10},
++  {1229,13,11,13,0,-10},
++  {1247,8,10,8,0,-10},
++  {1257,7,9,7,0,-8},
++  {1265,7,12,7,0,-11},
++  {1276,7,8,7,0,-8},
++  {1283,6,8,6,0,-8},
++  {1289,8,10,8,0,-8},
++  {1299,7,9,7,0,-8},
++  {1307,11,8,11,0,-8},
++  {1318,6,9,6,0,-8},
++  {1325,8,8,8,0,-8},
++  {1333,8,11,8,0,-11},
++  {1344,7,8,7,0,-8},
++  {1351,7,8,7,0,-8},
++  {1358,9,8,9,0,-8},
++  {1367,8,8,8,0,-8},
++  {1375,7,9,7,0,-8},
++  {1383,8,8,8,0,-8},
++  {1391,7,11,7,0,-8},
++  {1401,6,9,6,0,-8},
++  {1408,7,8,7,0,-8},
++  {1415,7,11,7,0,-8},
++  {1425,10,13,10,0,-10},
++  {1442,7,8,7,0,-8},
++  {1449,8,10,8,0,-8},
++  {1459,7,8,7,0,-8},
++  {1466,11,8,11,0,-8},
++  {1477,11,10,11,0,-8},
++  {1491,8,8,8,0,-8},
++  {1499,9,8,9,0,-8},
++  {1508,7,8,7,0,-8},
++  {1515,6,9,6,0,-8},
++  {1522,10,9,10,0,-8},
++  {1534,7,8,7,0,-8},
++  {0,0,0,0,0,0},
++  {1541,7,11,7,0,-10},
++};
++static const GFXfont RU2 PROGMEM = {(uint8_t*)RU2_bmp,(GFXglyph*)RU2_glyph,0x20,0x451,17};
++
++// RU4: DejaVu Sans Condensed 20px, 1-bit
++static const uint8_t RU4_bmp[] PROGMEM = {
++  0x18,0x30,0x60,0xC1,0x83,0x06,0x08,0x10,0x20,0x00,0x00,0x03,0x06,0x00,0x26,0x26,
++  0x26,0x26,0x26,0x26,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x03,0x30,0x04,
++  0x40,0x08,0x80,0x11,0x03,0xFF,0xC0,0xCC,0x01,0x10,0x02,0x20,0x7F,0xF8,0xFF,0xF0,
++  0x22,0x00,0x44,0x00,0x88,0x03,0x30,0x00,0x00,0x00,0x04,0x00,0x80,0x7E,0x1F,0xC2,
++  0x40,0x48,0x09,0x01,0xE0,0x1F,0x80,0xB8,0x13,0x02,0x64,0x4C,0xEB,0x0F,0xC0,0x20,
++  0x04,0x00,0x80,0x00,0x00,0x18,0x08,0x12,0x0C,0x19,0x84,0x08,0x46,0x04,0x22,0x03,
++  0x32,0x01,0x99,0x00,0x79,0x18,0x01,0x9E,0x00,0x99,0x80,0xCC,0x40,0x44,0x20,0x63,
++  0x10,0x21,0x98,0x30,0x78,0x00,0x00,0x0F,0x00,0x7E,0x01,0x80,0x04,0x00,0x10,0x00,
++  0x60,0x01,0xC0,0x0D,0x86,0x23,0x19,0x8E,0x46,0x1F,0x18,0x38,0x30,0x60,0xE7,0xC1,
++  0xF9,0x80,0x00,0x21,0x08,0x42,0x10,0x00,0x00,0x00,0x00,0x00,0x00,0x08,0x30,0x41,
++  0x83,0x06,0x08,0x10,0x20,0x40,0x81,0x03,0x06,0x04,0x0C,0x08,0x18,0x00,0x20,0x60,
++  0x40,0xC1,0x83,0x02,0x04,0x08,0x10,0x20,0x41,0x83,0x04,0x18,0x20,0x40,0x00,0x08,
++  0x04,0x12,0x45,0x41,0xC1,0xF1,0xAC,0x10,0x08,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
++  0x01,0x00,0x02,0x00,0x04,0x00,0x08,0x00,0x10,0x00,0x20,0x0F,0xFE,0x1F,0xFC,0x01,
++  0x00,0x02,0x00,0x04,0x00,0x08,0x00,0x10,0x00,0x30,0xC2,0x08,0x00,0x00,0x7C,0x00,
++  0x00,0x00,0x00,0x00,0x00,0x30,0xC0,0x00,0x04,0x18,0x20,0x41,0x83,0x04,0x08,0x30,
++  0x60,0x83,0x06,0x08,0x10,0x60,0xC0,0x0E,0x03,0xF0,0xC6,0x18,0x66,0x0C,0xC1,0x98,
++  0x33,0x06,0x60,0xCC,0x19,0x83,0x10,0x63,0x0C,0x73,0x07,0xC0,0x00,0x06,0x07,0xC0,
++  0xD8,0x03,0x00,0x60,0x0C,0x01,0x80,0x30,0x06,0x00,0xC0,0x18,0x03,0x00,0x60,0x7F,
++  0x8F,0xF0,0x1E,0x0F,0xF1,0x86,0x00,0x60,0x0C,0x01,0x00,0x60,0x18,0x03,0x00,0xC0,
++  0x30,0x0C,0x03,0x00,0xFF,0x9F,0xF0,0x1E,0x07,0xF0,0x06,0x00,0x60,0x0C,0x01,0x03,
++  0xE0,0x78,0x01,0x80,0x18,0x03,0x00,0x60,0x0C,0xC7,0x1F,0xC0,0x00,0x03,0x80,0x70,
++  0x1E,0x02,0xC0,0x98,0x33,0x04,0x61,0x8C,0x21,0x8C,0x31,0xFF,0x3F,0xE0,0x18,0x03,
++  0x00,0x60,0x3F,0x87,0xF0,0xC0,0x18,0x03,0x00,0x78,0x0F,0xC0,0x0C,0x00,0xC0,0x18,
++  0x03,0x00,0x60,0x1C,0xC7,0x1F,0xC0,0x00,0x07,0x83,0xF0,0x60,0x18,0x02,0x00,0xCC,
++  0x1F,0xE3,0x86,0x70,0xCC,0x19,0x81,0x10,0x63,0x0C,0x33,0x07,0xE0,0x00,0x7F,0xCF,
++  0xF8,0x02,0x00,0xC0,0x18,0x02,0x00,0xC0,0x18,0x02,0x00,0xC0,0x18,0x02,0x00,0xC0,
++  0x18,0x06,0x00,0x0F,0x07,0xF0,0xC3,0x10,0x62,0x0C,0x61,0x86,0xE0,0xF8,0x31,0x8C,
++  0x19,0x83,0x30,0x66,0x0C,0x73,0x87,0xE0,0x00,0x0E,0x07,0xF0,0xC6,0x30,0x66,0x0C,
++  0xC1,0x98,0x31,0x8E,0x3B,0xC3,0xD8,0x03,0x00,0x60,0x18,0x67,0x0F,0x80,0x00,0x30,
++  0xC0,0x00,0x00,0x00,0x00,0x30,0xC0,0x00,0x30,0xC0,0x00,0x00,0x00,0x00,0x30,0xC2,
++  0x08,0x00,0x00,0x00,0x00,0x00,0x70,0x03,0xC0,0x3E,0x01,0xE0,0x07,0x00,0x0F,0x00,
++  0x07,0xC0,0x01,0xE0,0x00,0xF0,0x00,0x20,0x00,0x00,0x3F,0xF8,0x7F,0xF0,0x00,0x00,
++  0x00,0x03,0xFF,0x87,0xFF,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x70,
++  0x00,0x78,0x00,0x3E,0x00,0x0F,0x00,0x07,0x00,0x1E,0x01,0xF0,0x0F,0x00,0x78,0x00,
++  0x80,0x00,0x00,0x00,0x1C,0x1F,0xC4,0x30,0x04,0x03,0x00,0xC0,0x60,0x30,0x08,0x06,
++  0x01,0x80,0x00,0x00,0x06,0x01,0x80,0x03,0xF0,0x01,0xC7,0x01,0x80,0x60,0x40,0x0C,
++  0x30,0xC1,0x08,0xFE,0x46,0x21,0x99,0x98,0x66,0x46,0x19,0x91,0x86,0x66,0x21,0x90,
++  0x8C,0xE8,0x21,0xFC,0x0C,0x00,0x01,0x80,0x00,0x30,0x30,0x07,0xF8,0x00,0x00,0x00,
++  0x00,0x00,0x06,0x00,0x38,0x03,0xC0,0x1A,0x00,0x98,0x0C,0xC0,0x62,0x02,0x18,0x30,
++  0xC1,0x82,0x0F,0xF8,0xC0,0xC6,0x02,0x20,0x1B,0x00,0xC0,0x3E,0x03,0xFC,0x30,0xC3,
++  0x06,0x30,0x63,0x0C,0x3F,0xC3,0xF8,0x30,0xC3,0x06,0x30,0x63,0x06,0x30,0x63,0xFC,
++  0x3F,0x80,0x07,0xC0,0xFF,0x8E,0x0C,0x60,0x26,0x00,0x30,0x01,0x80,0x0C,0x00,0x60,
++  0x03,0x00,0x18,0x00,0x60,0x03,0x01,0x0E,0x38,0x3F,0x80,0x00,0x3E,0x00,0xFF,0x03,
++  0x0E,0x0C,0x0C,0x30,0x30,0xC0,0x63,0x01,0x8C,0x06,0x30,0x18,0xC0,0x63,0x01,0x0C,
++  0x0C,0x30,0x70,0xFF,0x83,0xF8,0x00,0x3F,0xC7,0xF8,0xC0,0x18,0x03,0x00,0x60,0x0F,
++  0xF1,0xFE,0x30,0x06,0x00,0xC0,0x18,0x03,0x00,0x7F,0x8F,0xF0,0x3F,0x8F,0xE3,0x00,
++  0xC0,0x30,0x0C,0x03,0xF8,0xFE,0x30,0x0C,0x03,0x00,0xC0,0x30,0x0C,0x03,0x00,0x07,
++  0xC0,0x7F,0xC3,0x81,0x0C,0x00,0x60,0x01,0x80,0x06,0x00,0x18,0x3C,0x60,0xF1,0x80,
++  0x46,0x01,0x0C,0x04,0x30,0x10,0x71,0xC0,0xFE,0x00,0x00,0x30,0x30,0xC0,0xC3,0x03,
++  0x0C,0x0C,0x30,0x30,0xC0,0xC3,0xFF,0x0F,0xFC,0x30,0x30,0xC0,0xC3,0x03,0x0C,0x0C,
++  0x30,0x30,0xC0,0xC3,0x03,0x00,0x31,0x8C,0x63,0x18,0xC6,0x31,0x8C,0x63,0x18,0xC0,
++  0x18,0x61,0x86,0x18,0x61,0x86,0x18,0x61,0x86,0x18,0x61,0x84,0x33,0xCE,0x00,0x30,
++  0x71,0x87,0x0C,0x70,0x67,0x03,0x30,0x1B,0x00,0xF0,0x07,0x00,0x3C,0x01,0xB0,0x0C,
++  0xC0,0x63,0x03,0x0C,0x18,0x70,0xC1,0xC0,0x30,0x0C,0x03,0x00,0xC0,0x30,0x0C,0x03,
++  0x00,0xC0,0x30,0x0C,0x03,0x00,0xC0,0x30,0x0F,0xF3,0xFC,0x30,0x1C,0x38,0x1C,0x28,
++  0x3C,0x28,0x3C,0x2C,0x2C,0x24,0x6C,0x24,0x6C,0x26,0x4C,0x22,0xCC,0x22,0xCC,0x23,
++  0x8C,0x21,0x8C,0x20,0x0C,0x20,0x0C,0x20,0x0C,0x30,0x31,0xC1,0x8E,0x0C,0x58,0x62,
++  0xC3,0x13,0x18,0x98,0xC4,0x66,0x23,0x31,0x09,0x88,0x6C,0x41,0x62,0x0F,0x10,0x38,
++  0x81,0xC0,0x07,0x80,0x7F,0x83,0x87,0x0C,0x0C,0x60,0x19,0x80,0x66,0x01,0x98,0x06,
++  0x60,0x19,0x80,0x66,0x01,0x8C,0x06,0x30,0x30,0x73,0x80,0xFC,0x00,0x00,0x3E,0x07,
++  0xF0,0xC7,0x18,0x63,0x0C,0x61,0x8C,0x31,0x9E,0x3F,0x86,0x00,0xC0,0x18,0x03,0x00,
++  0x60,0x0C,0x00,0x07,0x80,0x7F,0x83,0x87,0x0C,0x0C,0x60,0x19,0x80,0x66,0x01,0x98,
++  0x06,0x60,0x19,0x80,0x66,0x01,0x8C,0x04,0x30,0x30,0x73,0x80,0xFC,0x00,0x30,0x00,
++  0x60,0x00,0xC0,0x3E,0x01,0xFC,0x0C,0x70,0x61,0x83,0x0C,0x18,0x60,0xC3,0x07,0xF0,
++  0x3F,0x81,0x8C,0x0C,0x30,0x60,0x83,0x06,0x18,0x30,0xC0,0xC0,0x0F,0x07,0xF8,0xC1,
++  0x30,0x06,0x00,0xC0,0x0F,0x00,0xFC,0x03,0xC0,0x18,0x01,0x00,0x24,0x0C,0xE3,0x8F,
++  0xE0,0x00,0xFF,0xE7,0xFF,0x01,0x00,0x08,0x00,0x40,0x02,0x00,0x10,0x00,0x80,0x04,
++  0x00,0x20,0x01,0x00,0x08,0x00,0x40,0x02,0x00,0x10,0x00,0x20,0x31,0x01,0x88,0x0C,
++  0x40,0x62,0x03,0x10,0x18,0x80,0xC4,0x06,0x20,0x31,0x01,0x88,0x0C,0x60,0x43,0x06,
++  0x0C,0x70,0x3F,0x00,0x00,0xC0,0x32,0x01,0x98,0x08,0xC0,0xC2,0x06,0x18,0x20,0xC3,
++  0x02,0x18,0x18,0x80,0xCC,0x02,0x60,0x1A,0x00,0xF0,0x03,0x80,0x18,0x00,0x40,0xC1,
++  0x98,0x30,0x66,0x1C,0x19,0x87,0x86,0x21,0x63,0x0C,0x48,0xC3,0x12,0x30,0xCC,0x8C,
++  0x33,0x32,0x04,0x8D,0x81,0xA1,0x60,0x78,0x58,0x1E,0x1C,0x03,0x07,0x00,0xC0,0xC0,
++  0x60,0x23,0x06,0x30,0xC1,0x8C,0x09,0x80,0xD0,0x07,0x00,0x60,0x0F,0x00,0xD0,0x19,
++  0x81,0x8C,0x30,0xC6,0x06,0x60,0x20,0xC0,0x63,0x06,0x18,0x30,0x63,0x03,0x18,0x0D,
++  0x80,0x38,0x01,0xC0,0x04,0x00,0x20,0x01,0x00,0x08,0x00,0x40,0x02,0x00,0x10,0x00,
++  0x7F,0xE7,0xFE,0x00,0x60,0x0C,0x01,0x80,0x18,0x03,0x00,0x60,0x0E,0x00,0xC0,0x18,
++  0x03,0x00,0x30,0x07,0xFF,0x7F,0xF0,0x38,0x40,0x81,0x02,0x04,0x08,0x10,0x20,0x40,
++  0x81,0x02,0x04,0x08,0x10,0x38,0x70,0x00,0xC1,0x81,0x02,0x06,0x0C,0x08,0x10,0x30,
++  0x20,0x40,0xC1,0x81,0x02,0x06,0x0C,0x38,0x10,0x20,0x40,0x81,0x02,0x04,0x08,0x10,
++  0x20,0x40,0x81,0x02,0x04,0x38,0x70,0x00,0x01,0x00,0x07,0x00,0x1B,0x00,0x63,0x01,
++  0x83,0x06,0x03,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
++  0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x7F,0xCF,0xF8,0x30,0x08,0x06,0x01,
++  0x80,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x3F,0x06,
++  0x70,0x06,0x00,0x41,0xF8,0x7F,0x18,0x23,0x04,0x61,0x8E,0x70,0xFA,0x00,0x00,0x00,
++  0x20,0x04,0x00,0x80,0x10,0x02,0xF0,0x73,0x0C,0x31,0x82,0x20,0x44,0x08,0x81,0x10,
++  0x23,0x0C,0x73,0x0B,0xE0,0x00,0x00,0x00,0x1F,0x8E,0x63,0x01,0x80,0x60,0x18,0x06,
++  0x01,0x80,0x20,0x0E,0x21,0xF8,0x00,0x00,0x00,0x00,0xC0,0x18,0x03,0x00,0x61,0xEC,
++  0x67,0x88,0x73,0x06,0x60,0xCC,0x19,0x83,0x30,0x66,0x0C,0x63,0x87,0xB0,0x00,0x00,
++  0x00,0x1F,0x07,0x30,0x83,0x30,0x66,0x0C,0xFF,0x98,0x03,0x00,0x20,0x07,0x18,0x7F,
++  0x00,0x00,0x00,0x1E,0x60,0xC1,0x8F,0xC6,0x0C,0x18,0x30,0x60,0xC1,0x83,0x06,0x0C,
++  0x00,0x1E,0xC6,0x79,0x83,0x30,0x66,0x0C,0xC1,0x98,0x33,0x06,0x21,0xC7,0xF8,0x7B,
++  0x00,0x60,0x08,0x67,0x0F,0xC0,0x00,0x00,0x00,0x20,0x04,0x00,0x80,0x10,0x02,0xF8,
++  0x73,0x0C,0x31,0x06,0x20,0xC4,0x18,0x83,0x10,0x62,0x0C,0x41,0x88,0x30,0x00,0x21,
++  0x00,0x02,0x10,0x84,0x21,0x08,0x42,0x10,0x80,0x20,0x80,0x00,0x20,0x82,0x08,0x20,
++  0x82,0x08,0x20,0x82,0x08,0x21,0x8C,0x00,0x00,0x20,0x04,0x00,0x80,0x10,0x02,0x0C,
++  0x43,0x08,0xC1,0x30,0x2C,0x07,0x00,0xB0,0x13,0x02,0x30,0x43,0x08,0x30,0x00,0x21,
++  0x08,0x42,0x10,0x84,0x21,0x08,0x42,0x10,0x80,0x2F,0x1E,0x0E,0x69,0x83,0x0C,0x30,
++  0x83,0x0C,0x20,0xC3,0x08,0x30,0xC2,0x0C,0x30,0x83,0x0C,0x20,0xC3,0x08,0x30,0xC2,
++  0x0C,0x30,0x00,0x00,0x2F,0x87,0x30,0xC3,0x10,0x62,0x0C,0x41,0x88,0x31,0x06,0x20,
++  0xC4,0x18,0x83,0x00,0x00,0x1F,0x07,0x70,0x83,0x30,0x66,0x0C,0xC1,0x98,0x33,0x06,
++  0x60,0xC6,0x30,0x7C,0x00,0x00,0x00,0x2F,0x07,0x30,0xC3,0x18,0x22,0x04,0x40,0x88,
++  0x11,0x02,0x30,0xC7,0x30,0xBE,0x10,0x02,0x00,0x40,0x08,0x00,0x00,0x00,0x00,0x1E,
++  0xC6,0x78,0x87,0x30,0x66,0x0C,0xC1,0x98,0x33,0x06,0x60,0xC6,0x38,0x7B,0x00,0x60,
++  0x0C,0x01,0x80,0x30,0x00,0x00,0x00,0x2E,0x38,0x30,0x20,0x20,0x20,0x20,0x20,0x20,
++  0x20,0x20,0x00,0x3F,0x38,0x98,0x0C,0x07,0x01,0xF0,0x1C,0x02,0x01,0x31,0x9F,0x80,
++  0x00,0x00,0x20,0x40,0x87,0xF2,0x04,0x08,0x10,0x20,0x40,0x81,0x03,0xE3,0xC0,0x00,
++  0x20,0xC4,0x18,0x83,0x10,0x62,0x0C,0x41,0x88,0x31,0x06,0x20,0xC6,0x78,0x7B,0x00,
++  0x00,0x00,0x40,0xCC,0x19,0x82,0x10,0xC3,0x18,0x62,0x04,0xC0,0xD8,0x1A,0x01,0xC0,
++  0x38,0x00,0x43,0x0C,0xC7,0x19,0x8E,0x21,0x14,0x42,0x69,0x86,0xDB,0x0D,0x34,0x0A,
++  0x28,0x1C,0x70,0x38,0xE0,0x61,0xC0,0x60,0xC6,0x30,0xCC,0x0D,0x80,0xE0,0x18,0x03,
++  0x80,0xD8,0x33,0x04,0x31,0x83,0x00,0x40,0xCC,0x19,0x82,0x10,0xC3,0x18,0x26,0x06,
++  0xC0,0xD0,0x0E,0x01,0xC0,0x30,0x06,0x00,0xC0,0x30,0x1E,0x00,0x00,0x7F,0xBF,0xC0,
++  0xC0,0xC0,0x60,0x60,0x60,0x60,0x60,0x30,0x1F,0xE0,0x03,0x80,0xC0,0x18,0x03,0x00,
++  0x60,0x0C,0x01,0x80,0x20,0x3C,0x07,0x80,0x10,0x03,0x00,0x60,0x0C,0x01,0x80,0x30,
++  0x06,0x00,0x70,0x00,0x00,0x00,0x30,0xC3,0x0C,0x30,0xC3,0x0C,0x30,0xC3,0x0C,0x30,
++  0xC3,0x0C,0x30,0xC3,0x0C,0x00,0x3C,0x01,0x80,0x10,0x02,0x00,0x40,0x08,0x01,0x80,
++  0x30,0x03,0x80,0x70,0x18,0x03,0x00,0x40,0x08,0x01,0x00,0x20,0x0C,0x07,0x80,0x00,
++  0x00,0x00,0x0E,0x00,0x7F,0x30,0x87,0xC0,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
++  0x00,0x1B,0x03,0x60,0x00,0x00,0x03,0xFC,0x7F,0x8C,0x01,0x80,0x30,0x06,0x00,0xFF,
++  0x1F,0xE3,0x00,0x60,0x0C,0x01,0x80,0x30,0x07,0xF8,0xFF,0x00,0x06,0x00,0x38,0x03,
++  0xC0,0x1A,0x00,0x98,0x0C,0xC0,0x62,0x02,0x18,0x30,0xC1,0x82,0x0F,0xF8,0xC0,0xC6,
++  0x02,0x20,0x1B,0x00,0xC0,0x3F,0xC3,0xFC,0x30,0x03,0x00,0x30,0x03,0x00,0x3F,0x03,
++  0xFC,0x30,0xE3,0x06,0x30,0x63,0x06,0x30,0x63,0xFC,0x3F,0x80,0x3E,0x03,0xFC,0x30,
++  0xC3,0x06,0x30,0x63,0x0C,0x3F,0xC3,0xF8,0x30,0xC3,0x06,0x30,0x63,0x06,0x30,0x63,
++  0xFC,0x3F,0x80,0x3F,0xC7,0xF8,0xC0,0x18,0x03,0x00,0x60,0x0C,0x01,0x80,0x30,0x06,
++  0x00,0xC0,0x18,0x03,0x00,0x60,0x0C,0x00,0x0F,0xF0,0x3F,0xC0,0xC3,0x03,0x0C,0x0C,
++  0x30,0x30,0xC0,0xC3,0x03,0x0C,0x08,0x30,0x60,0xC1,0x83,0x06,0x0C,0x18,0x31,0xFF,
++  0xE7,0xFF,0x90,0x02,0x40,0x09,0x00,0x20,0x00,0x00,0x3F,0xC7,0xF8,0xC0,0x18,0x03,
++  0x00,0x60,0x0F,0xF1,0xFE,0x30,0x06,0x00,0xC0,0x18,0x03,0x00,0x7F,0x8F,0xF0,0x60,
++  0x60,0x63,0x06,0x0C,0x38,0x61,0x81,0x86,0x30,0x0C,0x66,0x00,0x66,0xC0,0x07,0x6C,
++  0x00,0x7F,0xE0,0x0D,0xF6,0x00,0x8E,0x30,0x18,0x61,0x03,0x06,0x18,0x30,0x60,0xC6,
++  0x06,0x0C,0x40,0x60,0x60,0x3E,0x07,0xF8,0x40,0xC0,0x0C,0x00,0xC0,0x0C,0x1F,0x81,
++  0xF8,0x01,0xC0,0x0C,0x00,0x40,0x04,0x00,0xC7,0x38,0x7F,0x00,0x00,0x20,0x71,0x03,
++  0x88,0x3C,0x41,0xE2,0x1B,0x10,0xD8,0x8C,0xC4,0x66,0x26,0x31,0x31,0x8B,0x0C,0x58,
++  0x62,0x83,0x1C,0x18,0xC0,0xC0,0x08,0x80,0x7C,0x00,0x00,0x00,0x02,0x07,0x10,0x38,
++  0x83,0xC4,0x1E,0x21,0xB1,0x0D,0x88,0xCC,0x46,0x62,0x63,0x13,0x18,0xB0,0xC5,0x86,
++  0x28,0x31,0xC1,0x8C,0x0C,0x30,0x31,0x83,0x0C,0x30,0x63,0x03,0x38,0x1B,0x80,0xD8,
++  0x07,0xE0,0x39,0x01,0x8C,0x0C,0x30,0x61,0x83,0x06,0x18,0x18,0xC0,0xC0,0x0F,0xF0,
++  0x3F,0xC0,0xC3,0x03,0x0C,0x0C,0x30,0x30,0xC0,0xC3,0x03,0x0C,0x0C,0x30,0x20,0xC1,
++  0x83,0x06,0x0C,0x38,0x31,0xC0,0xC4,0x03,0x00,0x30,0x1C,0x38,0x1C,0x28,0x3C,0x28,
++  0x3C,0x2C,0x2C,0x24,0x6C,0x24,0x6C,0x26,0x4C,0x22,0xCC,0x22,0xCC,0x23,0x8C,0x21,
++  0x8C,0x20,0x0C,0x20,0x0C,0x20,0x0C,0x30,0x30,0xC0,0xC3,0x03,0x0C,0x0C,0x30,0x30,
++  0xC0,0xC3,0xFF,0x0F,0xFC,0x30,0x30,0xC0,0xC3,0x03,0x0C,0x0C,0x30,0x30,0xC0,0xC3,
++  0x03,0x00,0x07,0x80,0x7F,0x83,0x87,0x0C,0x0C,0x60,0x19,0x80,0x66,0x01,0x98,0x06,
++  0x60,0x19,0x80,0x66,0x01,0x8C,0x06,0x30,0x30,0x73,0x80,0xFC,0x00,0x00,0x3F,0xF0,
++  0xFF,0xC3,0x03,0x0C,0x0C,0x30,0x30,0xC0,0xC3,0x03,0x0C,0x0C,0x30,0x30,0xC0,0xC3,
++  0x03,0x0C,0x0C,0x30,0x30,0xC0,0xC3,0x03,0x00,0x3E,0x07,0xF0,0xC7,0x18,0x63,0x0C,
++  0x61,0x8C,0x31,0x9E,0x3F,0x86,0x00,0xC0,0x18,0x03,0x00,0x60,0x0C,0x00,0x07,0xC0,
++  0xFF,0x8E,0x0C,0x60,0x26,0x00,0x30,0x01,0x80,0x0C,0x00,0x60,0x03,0x00,0x18,0x00,
++  0x60,0x03,0x01,0x0E,0x38,0x3F,0x80,0x00,0xFF,0xE7,0xFF,0x01,0x00,0x08,0x00,0x40,
++  0x02,0x00,0x10,0x00,0x80,0x04,0x00,0x20,0x01,0x00,0x08,0x00,0x40,0x02,0x00,0x10,
++  0x00,0xC0,0x6C,0x19,0x83,0x30,0x43,0x18,0x63,0x06,0xC0,0xD8,0x1B,0x01,0xC0,0x38,
++  0x02,0x00,0xC0,0x78,0x0E,0x00,0x01,0x80,0x03,0x00,0x3F,0xC0,0xEF,0xC3,0x19,0xCC,
++  0x31,0x98,0x63,0x30,0xC2,0x61,0x8C,0xC3,0x18,0xC6,0x31,0xEF,0xC0,0xFF,0x00,0x30,
++  0x00,0x60,0x00,0x60,0x23,0x06,0x30,0xC1,0x8C,0x09,0x80,0xD0,0x07,0x00,0x60,0x0F,
++  0x00,0xD0,0x19,0x81,0x8C,0x30,0xC6,0x06,0x60,0x20,0x30,0x30,0xC0,0xC3,0x03,0x0C,
++  0x0C,0x30,0x30,0xC0,0xC3,0x03,0x0C,0x0C,0x30,0x30,0xC0,0xC3,0x03,0x0C,0x0C,0x30,
++  0x30,0xFF,0xE3,0xFF,0x80,0x02,0x00,0x08,0x00,0x20,0x00,0x00,0x20,0x62,0x06,0x20,
++  0x62,0x06,0x20,0x62,0x06,0x30,0x63,0xFE,0x1F,0xE0,0x06,0x00,0x60,0x06,0x00,0x60,
++  0x06,0x00,0x60,0x30,0x60,0x86,0x0C,0x10,0xC1,0x82,0x18,0x30,0x43,0x06,0x08,0x60,
++  0xC1,0x0C,0x18,0x21,0x83,0x04,0x30,0x60,0x86,0x0C,0x10,0xC1,0x82,0x18,0x30,0x43,
++  0x06,0x08,0x7F,0xFF,0x0F,0xFF,0xE0,0x30,0x60,0x83,0x06,0x08,0x30,0x60,0x83,0x06,
++  0x08,0x30,0x60,0x83,0x06,0x08,0x30,0x60,0x83,0x06,0x08,0x30,0x60,0x83,0x06,0x08,
++  0x30,0x60,0x83,0x06,0x08,0x30,0x60,0x83,0xFF,0xFE,0x3F,0xFF,0xE0,0x00,0x06,0x00,
++  0x00,0x60,0x00,0x06,0x00,0x00,0x00,0x7C,0x00,0xF8,0x00,0x30,0x00,0x60,0x00,0xC0,
++  0x01,0x80,0x03,0xF0,0x07,0xFC,0x0C,0x18,0x18,0x18,0x30,0x30,0x60,0x60,0xC1,0x81,
++  0xFF,0x03,0xFC,0x00,0x30,0x06,0x30,0x06,0x30,0x06,0x30,0x06,0x30,0x06,0x30,0x06,
++  0x3F,0x06,0x3F,0xC6,0x30,0xE6,0x30,0x66,0x30,0x66,0x30,0x66,0x30,0x66,0x3F,0xC6,
++  0x3F,0x86,0x30,0x03,0x00,0x30,0x03,0x00,0x30,0x03,0x00,0x3F,0x03,0xFC,0x30,0xE3,
++  0x06,0x30,0x63,0x06,0x30,0x63,0xFC,0x3F,0x80,0x1E,0x03,0xFC,0x10,0x30,0x00,0xC0,
++  0x06,0x00,0x30,0x00,0xC3,0xFE,0x1F,0xF0,0x01,0x00,0x18,0x00,0xC4,0x0C,0x39,0xE0,
++  0xFC,0x00,0x00,0x30,0x3C,0x06,0x0F,0xE0,0xC3,0x06,0x18,0xC0,0x63,0x18,0x0C,0x66,
++  0x01,0x8C,0xC0,0x31,0xF8,0x02,0x3F,0x00,0x46,0x60,0x18,0xC6,0x03,0x18,0xC0,0x63,
++  0x1C,0x18,0x61,0xC7,0x0C,0x1F,0x80,0x00,0x00,0x07,0xE0,0xFF,0x0C,0x18,0x60,0xC3,
++  0x06,0x18,0x30,0xC1,0x83,0xFC,0x0F,0xE0,0x63,0x03,0x18,0x30,0xC1,0x86,0x18,0x31,
++  0x81,0x80,0x3F,0x06,0x70,0x06,0x00,0x41,0xF8,0x7F,0x18,0x23,0x04,0x61,0x8E,0x70,
++  0xFA,0x00,0x00,0x00,0x00,0x01,0xF0,0xE0,0x18,0x06,0x00,0xFE,0x1E,0x63,0x86,0x60,
++  0xCC,0x19,0x83,0x30,0x66,0x0C,0x41,0x8C,0x60,0xF8,0x00,0x00,0x3F,0x07,0xF0,0x86,
++  0x10,0xC2,0x30,0x7E,0x08,0x61,0x06,0x20,0xC4,0x70,0xFC,0x00,0x3F,0x9F,0xC8,0x04,
++  0x02,0x01,0x00,0x80,0x40,0x20,0x10,0x08,0x00,0x0F,0xC0,0xFC,0x08,0x40,0x84,0x18,
++  0x41,0x84,0x18,0x41,0x84,0x10,0x43,0x04,0x7F,0xF4,0x03,0x40,0x34,0x03,0x1F,0x07,
++  0x30,0x83,0x30,0x66,0x0C,0xFF,0x98,0x03,0x00,0x20,0x07,0x18,0x7F,0x00,0x00,0x00,
++  0x61,0x86,0x31,0x8C,0x19,0x98,0x0D,0xB0,0x07,0xB0,0x0F,0xF0,0x19,0xD8,0x11,0x8C,
++  0x31,0x8C,0x21,0x86,0x61,0x82,0x7E,0x19,0xC0,0x10,0x04,0x1E,0x07,0x80,0x30,0x04,
++  0x01,0x10,0xC7,0xE0,0x00,0x00,0x00,0x20,0xC2,0x1C,0x21,0xC2,0x3C,0x22,0xC2,0x6C,
++  0x24,0xC2,0xCC,0x38,0xC3,0x8C,0x30,0xC0,0x11,0x01,0x10,0x0E,0x00,0x00,0x20,0xC2,
++  0x1C,0x21,0xC2,0x3C,0x22,0xC2,0x6C,0x24,0xC2,0xCC,0x38,0xC3,0x8C,0x30,0xC0,0x21,
++  0x84,0x30,0x8C,0x13,0x02,0xC0,0x7C,0x0C,0x81,0x18,0x21,0x84,0x10,0x83,0x00,0x1F,
++  0xC1,0xFC,0x18,0xC1,0x8C,0x18,0xC1,0x8C,0x18,0xC1,0x8C,0x30,0xC7,0x0C,0x60,0xC0,
++  0x30,0x70,0xE1,0xC2,0x87,0x0A,0x3C,0x2C,0xB0,0x92,0xC2,0x5B,0x09,0xCC,0x23,0x30,
++  0x80,0xC2,0x03,0x00,0x20,0xC2,0x0C,0x20,0xC2,0x0C,0x20,0xC3,0xFC,0x20,0xC2,0x0C,
++  0x20,0xC2,0x0C,0x20,0xC0,0x1F,0x07,0x70,0x83,0x30,0x66,0x0C,0xC1,0x98,0x33,0x06,
++  0x60,0xC6,0x30,0x7C,0x00,0x00,0x00,0x3F,0xC3,0xFC,0x20,0xC2,0x0C,0x20,0xC2,0x0C,
++  0x20,0xC2,0x0C,0x20,0xC2,0x0C,0x20,0xC0,0x2F,0x07,0x30,0xC3,0x18,0x22,0x04,0x40,
++  0x88,0x11,0x02,0x30,0xC7,0x30,0xBE,0x10,0x02,0x00,0x40,0x08,0x00,0x00,0x00,0x00,
++  0x1F,0x8E,0x63,0x01,0x80,0x60,0x18,0x06,0x01,0x80,0x20,0x0E,0x21,0xF8,0x00,0x00,
++  0x00,0x7F,0xDF,0xF0,0xC0,0x30,0x0C,0x03,0x00,0xC0,0x30,0x0C,0x03,0x00,0xC0,0x40,
++  0xCC,0x19,0x82,0x10,0xC3,0x18,0x26,0x06,0xC0,0xD0,0x0E,0x01,0xC0,0x30,0x06,0x00,
++  0xC0,0x30,0x1E,0x00,0x00,0x01,0x80,0x03,0x00,0x06,0x00,0x0C,0x01,0xDF,0x86,0x7B,
++  0x18,0x63,0x30,0xC2,0x61,0x84,0xC3,0x09,0x86,0x13,0x0C,0x26,0x18,0xC6,0x7B,0x87,
++  0x7E,0x00,0xC0,0x01,0x80,0x03,0x00,0x06,0x00,0x00,0x00,0x60,0xC6,0x30,0xCC,0x0D,
++  0x80,0xE0,0x18,0x03,0x80,0xD8,0x33,0x04,0x31,0x83,0x00,0x20,0xC2,0x0C,0x20,0xC2,
++  0x0C,0x20,0xC2,0x0C,0x20,0xC2,0x0C,0x20,0xC2,0x0C,0x3F,0xE0,0x02,0x00,0x20,0x02,
++  0x61,0x8C,0x31,0x86,0x30,0xC2,0x18,0x7F,0x00,0x60,0x0C,0x01,0x80,0x30,0x06,0x00,
++  0x21,0x86,0x21,0x86,0x21,0x86,0x21,0x86,0x21,0x86,0x21,0x86,0x21,0x86,0x21,0x86,
++  0x21,0x86,0x21,0x86,0x3F,0xFE,0x21,0x86,0x10,0xC3,0x08,0x61,0x84,0x30,0xC2,0x18,
++  0x61,0x0C,0x30,0x86,0x18,0x43,0x0C,0x21,0x86,0x10,0xC3,0x0F,0xFF,0xC0,0x00,0x20,
++  0x00,0x10,0x00,0x08,0x78,0x03,0xC0,0x02,0x00,0x10,0x00,0x80,0x07,0xF0,0x21,0x81,
++  0x06,0x08,0x30,0x47,0x03,0xF0,0x20,0x10,0x80,0x42,0x01,0x08,0x04,0x20,0x10,0xFE,
++  0x42,0x19,0x08,0x34,0x20,0x90,0x8E,0x43,0xF1,0x00,0x00,0x20,0x04,0x00,0x80,0x10,
++  0x02,0x00,0x7F,0x08,0x61,0x06,0x20,0x84,0x70,0xFC,0x00,0x7C,0x19,0xC0,0x30,0x06,
++  0x01,0x8F,0xE0,0x18,0x06,0x03,0x11,0xC7,0xE0,0x00,0x00,0x00,0x21,0xF0,0x47,0x30,
++  0x8C,0x31,0x30,0x63,0xE0,0xC7,0xC1,0x89,0x83,0x13,0x06,0x23,0x0C,0x47,0x30,0x87,
++  0xC0,0x00,0x00,0x00,0x00,0x1F,0x87,0xF0,0x82,0x10,0x43,0x08,0x3F,0x03,0x20,0xC4,
++  0x10,0x86,0x11,0x82,0x00,0x1B,0x03,0x60,0x00,0x00,0x01,0xF0,0x73,0x08,0x33,0x06,
++  0x60,0xCF,0xF9,0x80,0x30,0x02,0x00,0x71,0x87,0xF0,0x00,0x00,0x00,
++};
++static const GFXglyph RU4_glyph[] PROGMEM = {
++  {0,0,0,6,0,0},
++  {0,7,15,7,0,-15},
++  {14,8,15,8,0,-15},
++  {29,15,15,15,0,-15},
++  {58,11,19,11,0,-16},
++  {85,17,16,17,0,-15},
++  {119,14,16,14,0,-15},
++  {147,5,15,5,0,-15},
++  {157,7,19,7,0,-16},
++  {174,7,19,7,0,-16},
++  {191,9,15,9,0,-15},
++  {208,15,13,15,0,-13},
++  {233,6,6,6,0,-3},
++  {238,7,7,7,0,-7},
++  {245,6,3,6,0,-3},
++  {248,7,17,6,0,-15},
++  {263,11,16,11,0,-15},
++  {285,11,15,11,0,-15},
++  {306,11,15,11,0,-15},
++  {327,11,16,11,0,-15},
++  {349,11,15,11,0,-15},
++  {370,11,16,11,0,-15},
++  {392,11,16,11,0,-15},
++  {414,11,15,11,0,-15},
++  {435,11,16,11,0,-15},
++  {457,11,16,11,0,-15},
++  {479,6,11,6,0,-11},
++  {488,6,14,6,0,-11},
++  {499,15,12,15,0,-12},
++  {522,15,10,15,0,-10},
++  {541,15,12,15,0,-12},
++  {564,10,15,10,0,-15},
++  {583,18,19,18,0,-15},
++  {626,13,15,12,0,-15},
++  {651,12,15,12,0,-15},
++  {674,13,16,13,0,-15},
++  {700,14,15,14,0,-15},
++  {727,11,15,11,0,-15},
++  {748,10,15,10,0,-15},
++  {767,14,16,14,0,-15},
++  {795,14,15,14,0,-15},
++  {822,5,15,5,0,-15},
++  {832,6,19,5,-1,-15},
++  {847,13,15,12,0,-15},
++  {872,10,15,10,0,-15},
++  {891,16,15,16,0,-15},
++  {921,13,15,13,0,-15},
++  {946,14,16,14,0,-15},
++  {974,11,15,11,0,-15},
++  {995,14,18,14,0,-15},
++  {1027,13,15,13,0,-15},
++  {1052,11,16,11,0,-15},
++  {1074,13,15,11,-1,-15},
++  {1099,13,16,13,0,-15},
++  {1125,13,15,12,0,-15},
++  {1150,18,15,18,0,-15},
++  {1184,12,15,12,0,-15},
++  {1207,13,15,11,-1,-15},
++  {1232,12,15,12,0,-15},
++  {1255,7,19,7,0,-16},
++  {1272,7,17,6,0,-15},
++  {1287,7,19,7,0,-16},
++  {1304,15,15,15,0,-15},
++  {1333,11,5,9,-1,0},
++  {1340,9,16,9,0,-16},
++  {1358,11,13,11,0,-12},
++  {1376,11,17,11,0,-16},
++  {1400,10,13,10,0,-12},
++  {1417,11,17,11,0,-16},
++  {1441,11,13,11,0,-12},
++  {1459,7,16,6,0,-16},
++  {1473,11,17,11,0,-12},
++  {1497,11,16,11,0,-16},
++  {1519,5,16,5,0,-16},
++  {1529,6,21,5,-1,-16},
++  {1545,11,16,10,0,-16},
++  {1567,5,16,5,0,-16},
++  {1577,18,12,18,0,-12},
++  {1604,11,12,11,0,-12},
++  {1621,11,13,11,0,-12},
++  {1639,11,17,11,0,-12},
++  {1663,11,17,11,0,-12},
++  {1687,8,12,7,0,-12},
++  {1699,9,13,9,0,-12},
++  {1714,7,15,7,0,-15},
++  {1728,11,13,11,0,-12},
++  {1746,11,11,11,0,-11},
++  {1762,15,11,15,0,-11},
++  {1783,11,11,11,0,-11},
++  {1799,11,16,11,0,-11},
++  {1821,9,11,9,0,-11},
++  {1834,11,20,11,0,-16},
++  {1862,6,21,6,0,-16},
++  {1878,11,20,11,0,-16},
++  {1906,15,8,15,0,-8},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {1921,11,19,11,0,-19},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {0,0,0,0,0,0},
++  {1948,13,15,12,0,-15},
++  {1973,12,15,12,0,-15},
++  {1996,12,15,12,0,-15},
++  {2019,11,15,11,0,-15},
++  {2040,14,19,14,0,-15},
++  {2074,11,15,11,0,-15},
++  {2095,20,15,19,0,-15},
++  {2133,12,16,12,0,-15},
++  {2157,13,15,13,0,-15},
++  {2182,13,19,13,0,-19},
++  {2213,13,15,13,0,-15},
++  {2238,14,15,14,0,-15},
++  {2265,16,15,16,0,-15},
++  {2295,14,15,14,0,-15},
++  {2322,14,16,14,0,-15},
++  {2350,14,15,14,0,-15},
++  {2377,11,15,11,0,-15},
++  {2398,13,16,13,0,-15},
++  {2424,13,15,11,-1,-15},
++  {2449,11,15,11,0,-15},
++  {2470,15,15,15,0,-15},
++  {2499,12,15,12,0,-15},
++  {2522,14,19,14,0,-15},
++  {2556,12,15,12,0,-15},
++  {2579,19,15,19,0,-15},
++  {2615,20,19,20,0,-15},
++  {2663,15,15,15,0,-15},
++  {2692,16,15,16,0,-15},
++  {2722,12,15,12,0,-15},
++  {2745,13,16,13,0,-15},
++  {2771,19,16,19,0,-15},
++  {2809,13,15,13,0,-15},
++  {2834,11,13,11,0,-12},
++  {2852,11,17,11,0,-16},
++  {2876,11,11,11,0,-11},
++  {2892,9,11,9,0,-11},
++  {2905,12,14,12,0,-11},
++  {2926,11,13,11,0,-12},
++  {2944,16,11,16,0,-11},
++  {2966,10,13,10,0,-12},
++  {2983,12,11,12,0,-11},
++  {3000,12,15,12,0,-15},
++  {3023,11,11,11,0,-11},
++  {3039,12,11,12,0,-11},
++  {3056,14,11,14,0,-11},
++  {3076,12,11,12,0,-11},
++  {3093,11,13,11,0,-12},
++  {3111,12,11,12,0,-11},
++  {3128,11,17,11,0,-12},
++  {3152,10,13,10,0,-12},
++  {3169,10,11,10,0,-11},
++  {3183,11,16,11,0,-11},
++  {3205,15,20,15,0,-15},
++  {3243,11,11,11,0,-11},
++  {3259,12,14,12,0,-11},
++  {3280,11,11,11,0,-11},
++  {3296,16,11,16,0,-11},
++  {3318,17,14,17,0,-11},
++  {3348,13,11,13,0,-11},
++  {3366,14,12,14,0,-12},
++  {3387,11,11,11,0,-11},
++  {3403,10,13,10,0,-12},
++  {3420,15,13,15,0,-12},
++  {3445,11,11,11,0,-11},
++  {0,0,0,0,0,0},
++  {3461,11,17,11,0,-16},
++};
++static const GFXfont RU4 PROGMEM = {(uint8_t*)RU4_bmp,(GFXglyph*)RU4_glyph,0x20,0x451,24};
+diff --git a/tools/gen_ru_font.py b/tools/gen_ru_font.py
+new file mode 100644
+index 0000000..f156abc
+--- /dev/null
++++ b/tools/gen_ru_font.py
+@@ -0,0 +1,57 @@
++# Генератор растровых GFX-шрифтов (латиница + кириллица) из DejaVu Sans Condensed для TFT_eSPI.
++# Запуск: python3 gen_ru_font.py  ->  src/ru_fonts.h
++from PIL import Image, ImageDraw, ImageFont
++import sys
++TTF = "/usr/share/fonts/truetype/dejavu/DejaVuSansCondensed.ttf"
++FIRST, LAST = 0x20, 0x451
++CODES = list(range(0x20, 0x7F)) + [0x401] + list(range(0x410, 0x450)) + [0x451]
++SIZES = [("RU1", 10), ("RU2", 13), ("RU4", 20)]
++
++def build(size):
++    f = ImageFont.truetype(TTF, size, layout_engine=ImageFont.Layout.BASIC)
++    asc, desc = f.getmetrics()
++    bitmap = bytearray(); glyphs = {}
++    for cp in CODES:
++        ch = chr(cp)
++        adv = int(round(f.getlength(ch)))
++        l, t, r, b = f.getbbox(ch, anchor="ls")
++        w, h = r - l, b - t
++        if ch == " " or w <= 0 or h <= 0:
++            glyphs[cp] = (len(bitmap), 0, 0, adv, 0, 0); continue
++        img = Image.new("L", (w, h), 0)
++        d = ImageDraw.Draw(img); d.fontmode = "1"
++        d.text((-l, -t), ch, font=f, fill=255, anchor="ls")
++        px = [1 if img.getpixel((x, y)) > 127 else 0 for y in range(h) for x in range(w)]
++        off = len(bitmap)
++        for i in range(0, len(px), 8):
++            byte = 0
++            for k in range(8):
++                byte = (byte << 1) | (px[i + k] if i + k < len(px) else 0)
++            bitmap.append(byte)
++        glyphs[cp] = (off, w, h, adv, l, t)
++    return bitmap, glyphs, asc + desc
++
++def emit(out, name, size):
++    bitmap, glyphs, yadv = build(size)
++    out.append(f"// {name}: DejaVu Sans Condensed {size}px, 1-bit")
++    out.append(f"static const uint8_t {name}_bmp[] PROGMEM = {{")
++    for i in range(0, len(bitmap), 16):
++        out.append("  " + ",".join(f"0x{b:02X}" for b in bitmap[i:i+16]) + ",")
++    out.append("};")
++    out.append(f"static const GFXglyph {name}_glyph[] PROGMEM = {{")
++    for cp in range(FIRST, LAST + 1):
++        g = glyphs.get(cp, (0, 0, 0, 0, 0, 0))
++        out.append(f"  {{{g[0]},{g[1]},{g[2]},{g[3]},{g[4]},{g[5]}}},")
++    out.append("};")
++    out.append(f"static const GFXfont {name} PROGMEM = {{(uint8_t*){name}_bmp,(GFXglyph*){name}_glyph,0x{FIRST:02X},0x{LAST:03X},{yadv}}};\n")
++    return bitmap, glyphs
++
++out = ["// Сгенерировано tools/gen_ru_font.py. Не править вручную.",
++       "// Шрифты: латиница + кириллица (Ё, А-я, ё) для TFT_eSPI (формат GFX). Исходник: DejaVu Sans (Bitstream Vera licence).",
++       "#pragma once", "#include <TFT_eSPI.h>", ""]
++data = {}
++for n, s in SIZES:
++    data[n] = emit(out, n, s)
++open(sys.argv[1] if len(sys.argv) > 1 else "src/ru_fonts.h", "w").write("\n".join(out))
++
++print("bytes:", {n: len(data[n][0]) for n, _ in SIZES})

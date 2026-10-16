@@ -684,7 +684,7 @@ static bool shfwDetect() {
 }
 
 // ---------- бэкап/восстановление: слоты в NVS, у каждого сохранена версия SHFW ----------
-#define SHFW_SLOTS 5            // 0-3 ручные, 4 = автокопия перед восстановлением
+#define SHFW_SLOTS 3            // 0-3 ручные, 4 = автокопия перед восстановлением
 #define SHFW_UNDO_SLOT 4
 struct __attribute__((packed)) ShfwBlobHdr {
   char magic[2]; uint8_t fmt, verLen; uint8_t ver[SHFW_VER_MAX]; uint16_t tableId, dumpBytes, crc;
@@ -762,8 +762,82 @@ static bool shfwDumpRead() {
   return true;
 }
 
+// =====================================================================
+//   ПОЛНОЕ ЧТЕНИЕ КОНФИГА ESC: 256 слов = 512 байт (ТОЛЬКО ЧТЕНИЕ, ничего не пишет)
+//   Запуск: отправьте символ 'f' в последовательный монитор (115200).
+//   Адрес - в словах, диапазон [from, to). Результат печатается в Serial.
+// =====================================================================
+struct ShfwScanSeg { const char* name; uint16_t from, to; };
+static const ShfwScanSeg SHFW_SCAN_SEGS[] = {
+  {"W00",    0x00, 0x01},   // слово 0x00 - вне профилей, но входит в 512 байт
+  {"PROF1",  0x01, 0x3C},   // 1-й профиль
+  {"PROF2",  0x3C, 0x77},   // 2-й профиль
+  {"PROF3",  0x77, 0xB2},   // 3-й профиль
+  {"GLOBAL", 0xB2, 0x100},  // глобальные настройки
+};
+static const uint8_t SHFW_SCAN_SEG_N = sizeof(SHFW_SCAN_SEGS) / sizeof(SHFW_SCAN_SEGS[0]);
+static uint8_t shfwFull[512];       // сырые байты, как пришли от ESC
+static uint8_t shfwFullOk[256];     // 1 - слово прочитано
+
+// Читает n слов с адреса from в out[0..2n), ok[i]=1 - слово прочитано (нечитаемые обнуляются).
+// При ошибке дробит: блок до 40 слов (0x50 байт) -> 8 слов -> по одному слову.
+static void shfwReadWords(uint16_t from, uint16_t n, uint8_t* out, uint8_t* ok) {
+  if (!shfwLive()) { memset(out, 0, n * 2); memset(ok, 0, n); return; }
+  if (shfwReadBlock((uint8_t)from, (uint8_t)(n * 2), out)) { memset(ok, 1, n); return; }
+  if (n > 8) {
+    for (uint16_t off = 0; off < n; off += 8)
+      shfwReadWords(from + off, (n - off) < 8 ? (n - off) : 8, out + off * 2, ok + off);
+    return;
+  }
+  if (n > 1) {
+    for (uint16_t i = 0; i < n; i++) shfwReadWords(from + i, 1, out + i * 2, ok + i);
+    return;
+  }
+  ok[0] = 0;
+  out[0] = out[1] = 0;
+}
+
+static void shfwScanChunk(uint16_t from, uint16_t n) { shfwReadWords(from, n, shfwFull + from * 2, shfwFullOk + from); }
+
+static void shfwFullScan() {
+  if (!shfwLive()) { Serial.println("SHFW SCAN: нет связи с самокатом (ждите LIVE)"); return; }
+  memset(shfwFull, 0, sizeof(shfwFull));
+  memset(shfwFullOk, 0, sizeof(shfwFullOk));
+  char hv[2 * SHFW_VER_MAX + 1] = "-";
+  if (shfwReadVersion()) shfwHex(shfwVer, shfwVerLen, hv, sizeof(hv));
+  Serial.printf("SHFW SCAN BEGIN ver=%s (адреса в словах, байты как пришли)\n", hv);
+  uint32_t t0 = millis();
+  const uint16_t CHUNK = SHFW_MAX_XFER / 2;                      // 40 слов
+  for (uint8_t s = 0; s < SHFW_SCAN_SEG_N; s++) {
+    const ShfwScanSeg& g = SHFW_SCAN_SEGS[s];
+    for (uint16_t a = g.from; a < g.to; a += CHUNK)
+      shfwScanChunk(a, (g.to - a) < CHUNK ? (g.to - a) : CHUNK);
+  }
+  uint16_t okTotal = 0;
+  for (uint8_t s = 0; s < SHFW_SCAN_SEG_N; s++) {
+    const ShfwScanSeg& g = SHFW_SCAN_SEGS[s];
+    uint16_t words = g.to - g.from, ok = 0;
+    for (uint16_t a = g.from; a < g.to; a++) ok += shfwFullOk[a];
+    okTotal += ok;
+    Serial.printf("== %s: слова 0x%02X..0x%02X (%u сл, %u байт), прочитано %u/%u, crc16=%04X\n",
+                  g.name, g.from, g.to - 1, words, words * 2, ok, words,
+                  shfwCrc16(shfwFull + g.from * 2, words * 2));
+    for (uint16_t a = g.from; a < g.to; a += 8) {
+      char line[8 * 5 + 1];
+      size_t o = 0;
+      for (uint16_t w = a; w < g.to && w < a + 8; w++) {
+        if (shfwFullOk[w]) o += snprintf(line + o, sizeof(line) - o, "%02X%02X ", shfwFull[w * 2], shfwFull[w * 2 + 1]);
+        else               o += snprintf(line + o, sizeof(line) - o, "---- ");
+      }
+      Serial.printf("%s %02X: %s\n", g.name, a, line);
+    }
+  }
+  Serial.printf("SHFW SCAN END: прочитано %u/256 слов (%u/512 байт) за %lu мс\n",
+                okTotal, okTotal * 2, (unsigned long)(millis() - t0));
+}
+
 enum ShfwBakResult : uint8_t { BK_OK, BK_LOCKED, BK_NO_LINK, BK_MOVING, BK_NOT_SHFW, BK_NO_VERSION, BK_EMPTY, BK_BAD_SLOT,
-                               BK_VER_MISMATCH, BK_READ_FAIL, BK_SAVE_FAIL, BK_WRITE_FAIL, BK_RESERVED };
+                               BK_VER_MISMATCH, BK_READ_FAIL, BK_SAVE_FAIL, BK_WRITE_FAIL, BK_RESERVED, BK_NOCHANGE };
 
 static ShfwBakResult shfwBackup(uint8_t slot) {
   if (slot >= SHFW_UNDO_SLOT) return BK_RESERVED;
@@ -1251,7 +1325,7 @@ void nextPage(int dir) {
 
 // ---------- Экраны ----------
 enum Scr : uint8_t { S_MAIN, S_SET, S_APPEAR, S_DISPLAY, S_GAUGE, S_WIDGETS, S_LED, S_OTA, S_PICK, S_CAL,
-                     S_SHFW, S_SHFW_LIST, S_SHFW_EDIT, S_SHFW_BAK };
+                     S_SHFW, S_SHFW_LIST, S_SHFW_EDIT, S_SHFW_BAK, S_SHFW_PROF };
 static Scr scr = S_MAIN;
 static Scr pickReturn = S_WIDGETS;
 static uint8_t pickSlot = 0;
@@ -1845,6 +1919,11 @@ static int32_t shfwEdit = 0, shfwOrig = 0;     // выбранное и счит
 static bool shfwEditReady = false;             // значение удалось прочитать
 static char shfwMsg[200] = "";
 static int8_t shfwBakSel = 0;
+struct ShfwPSlot { bool valid; uint8_t profile, verLen; uint8_t ver[SHFW_VER_MAX]; };
+static ShfwPSlot shfwPSlots[4];       // 0-2 - копии профилей 1-3, 3 - автокопия перед восстановлением
+static int8_t shfwProfSel = 0;        // выбранная карточка: 0-2 - профиль 1-3, 3 - Отмена
+static uint8_t shfwProfActive = 0;    // активный профиль (0 - неизвестен)
+static uint16_t shfwProfGot = 0;      // сколько слов профиля прочитано при последней копии
 static uint16_t shfwMsgCol = 0;
 
 static const char* shfwGroupName(uint8_t g) { return cfg.lang ? SHFW_GROUP_RU[g] : SHFW_GROUP_NAMES[g]; }
@@ -2148,23 +2227,23 @@ void drawSettingsScreen() {
       drawS(shfwEnabled ? TR("EDITING: ON", "Правка: ВКЛ") : TR("EDITING: OFF", "Правка: ВЫКЛ"), 20, 55, 2);
       tft.setTextColor(shfwEnabled ? COL_BG : COL_DIM, shfwEnabled ? COL_WARN : COL_PANEL);
       drawS(TR("hold to change (resets on restart)", "удерживайте (сбросится при перезапуске)"), 20, 76, 1);
-      for (int g = 0; g <= SG_COUNT; g++) {                     // последняя строка - копии
-        int y = 98 + g * 28;
-        bool bak = g == SG_COUNT;
-        tft.fillRoundRect(8, y, 224, 25, 6, COL_PANEL);
-        tft.fillRect(8, y + 3, 3, 19, bak ? COL_WARN : (g == SG_EXPERT ? COL_BAD : COL_ACCENT));
+      for (int g = 0; g <= SG_COUNT + 1; g++) {                 // предпоследняя строка - профили, последняя - копии
+        int y = 98 + g * 25;
+        bool prof = g == SG_COUNT, bak = g == SG_COUNT + 1, grp = g < SG_COUNT;
+        tft.fillRoundRect(8, y, 224, 22, 6, COL_PANEL);
+        tft.fillRect(8, y + 3, 3, 16, bak ? COL_WARN : (prof ? COL_GOOD : (g == SG_EXPERT ? COL_BAD : COL_ACCENT)));
         tft.setTextDatum(ML_DATUM);
         tft.setTextPadding(0);
         tft.setTextColor(g == SG_EXPERT ? COL_BAD : COL_TXT, COL_PANEL);
-        drawS(bak ? TR("Backup / restore", "Копии / восстановление") : shfwGroupName(g), 20, y + 12, 2);
-        if (!bak) {
+        drawS(bak ? TR("Backup / restore", "Копии / восстановление") : (prof ? TR("Profiles", "Профили") : shfwGroupName(g)), 20, y + 11, 2);
+        if (grp) {
           snprintf(sb, sizeof(sb), "%d", shfwGroupCount(g));
           tft.setTextDatum(MR_DATUM);
           tft.setTextColor(COL_DIM, COL_PANEL);
-          drawS(sb, 206, y + 12, 2);
+          drawS(sb, 206, y + 11, 2);
         }
-        tft.drawLine(216, y + 7, 222, y + 12, COL_DIM);
-        tft.drawLine(222, y + 12, 216, y + 17, COL_DIM);
+        tft.drawLine(216, y + 6, 222, y + 11, COL_DIM);
+        tft.drawLine(222, y + 11, 216, y + 16, COL_DIM);
       }
       secLabel(8, 297, TR("Standstill only; verified after write", "Только на стоянке; запись проверяется"));
       if (shfwLive() && shfwDetected >= 0 && shfwDiag[0]) secLabel(8, 307, shfwDiag);
@@ -2212,6 +2291,62 @@ void drawSettingsScreen() {
       tft.setTextColor(shfwEnabled ? COL_BG : COL_DIM, shfwEnabled ? COL_ACCENT : COL_PANEL);
       drawS(TR("RESTORE", "ВОССТАНОВИТЬ"), 178, 247, 2);
       drawS(shfwEnabled ? TR("hold", "удерживайте") : TR("editing is OFF", "правка выключена"), 178, 264, 1);
+      if (shfwMsg[0]) {
+        tft.setTextColor(shfwMsgCol, COL_BG);
+        shfwDrawWrapped(shfwMsg, 8, 278, 224, 3);
+      }
+      break;
+    }
+    case S_SHFW_PROF: {
+      settingsHeader(TR("SHFW PROFILES", "Профили SHFW"));
+      char hb[72], vb[96];
+      tft.setTextDatum(TL_DATUM);
+      tft.setTextPadding(0);
+      tft.setTextColor(COL_DIM, COL_BG);
+      if (shfwProfActive) snprintf(vb, sizeof(vb), "%s %d", TR("active profile:", "активный профиль:"), shfwProfActive);
+      else snprintf(vb, sizeof(vb), "%s", TR("active profile: unknown", "активный профиль: неизвестен"));
+      drawS(shfwFit(vb, 1, 224), 8, 34, 1);
+      for (int i = 0; i < 4; i++) {
+        int y = 48 + i * 36;
+        tft.fillRoundRect(8, y, 224, 33, 6, COL_PANEL);
+        if (i == shfwProfSel) tft.drawRoundRect(8, y, 224, 33, 6, COL_ACCENT);
+        tft.setTextDatum(TL_DATUM);
+        tft.setTextPadding(0);
+        tft.setTextColor(COL_TXT, COL_PANEL);
+        if (i < 3) snprintf(vb, sizeof(vb), "%s %d", TR("Profile", "Профиль"), i + 1);
+        else if (shfwPSlots[3].valid) snprintf(vb, sizeof(vb), "%s %d)", TR("UNDO (auto, profile", "Отмена (авто, профиль"), shfwPSlots[3].profile);
+        else snprintf(vb, sizeof(vb), "%s", TR("UNDO (auto, before restore)", "Отмена (авто, до восстановления)"));
+        drawS(vb, 16, y + 3, 2);
+        if (i < 3 && shfwProfActive == i + 1) {
+          tft.setTextDatum(TR_DATUM);
+          tft.setTextColor(COL_GOOD, COL_PANEL);
+          drawS(TR("ACTIVE", "АКТИВЕН"), 224, y + 6, 1);
+        }
+        tft.setTextDatum(TL_DATUM);
+        tft.setTextColor(COL_DIM, COL_PANEL);
+        if (shfwPSlots[i].valid) {
+          shfwHex(shfwPSlots[i].ver, shfwPSlots[i].verLen > 8 ? 8 : shfwPSlots[i].verLen, hb, sizeof(hb));
+          drawS(hb, 16, y + 21, 1);
+          bool same = shfwVerLen && shfwPSlots[i].verLen == shfwVerLen && !memcmp(shfwPSlots[i].ver, shfwVer, shfwVerLen);
+          tft.setTextDatum(TR_DATUM);
+          tft.setTextColor(same ? COL_GOOD : COL_BAD, COL_PANEL);
+          drawS(same ? TR("version OK", "версия совпадает") : TR("other version", "другая версия"), 224, y + 21, 1);
+        } else drawS(TR("no backup", "нет копии"), 16, y + 21, 1);
+      }
+      tft.fillRoundRect(8, 194, 108, 40, 6, shfwEnabled ? COL_ACCENT : COL_PANEL);
+      tft.fillRoundRect(124, 194, 108, 40, 6, COL_PANEL);
+      tft.fillRoundRect(8, 238, 224, 34, 6, shfwEnabled ? COL_ACCENT : COL_PANEL);
+      tft.setTextDatum(MC_DATUM);
+      tft.setTextColor(shfwEnabled ? COL_BG : COL_DIM, shfwEnabled ? COL_ACCENT : COL_PANEL);
+      drawS(TR("SWITCH", "ВКЛЮЧИТЬ"), 62, 207, 2);
+      drawS(shfwEnabled ? TR("hold", "удерживайте") : TR("editing is OFF", "правка выключена"), 62, 224, 1);
+      tft.setTextColor(COL_TXT, COL_PANEL);
+      drawS(TR("BACKUP", "КОПИЯ"), 178, 207, 2);
+      tft.setTextColor(COL_DIM, COL_PANEL);
+      drawS(TR("hold = overwrite", "удерж.=замена"), 178, 224, 1);
+      tft.setTextColor(shfwEnabled ? COL_BG : COL_DIM, shfwEnabled ? COL_ACCENT : COL_PANEL);
+      drawS(TR("RESTORE", "ВОССТАНОВИТЬ"), 120, 248, 2);
+      drawS(shfwEnabled ? TR("hold", "удерживайте") : TR("editing is OFF", "правка выключена"), 120, 264, 1);
       if (shfwMsg[0]) {
         tft.setTextColor(shfwMsgCol, COL_BG);
         shfwDrawWrapped(shfwMsg, 8, 278, 224, 3);
@@ -2379,6 +2514,167 @@ void openSettings() { goScr(S_SET); }
 void leaveSettings() { goScr(S_MAIN); }
 void openPicker(uint8_t slot, Scr ret) { pickSlot = slot; pickReturn = ret; goScr(S_PICK); }
 
+// =====================================================================
+//   ПРОФИЛИ SHFW: переключение и копии по профилям
+//   Профиль = 59 слов (118 байт): №1 0x01..0x3B, №2 0x3C..0x76, №3 0x77..0xB1.
+//   Активный профиль - слово 0xB2 (младший байт 1..3), переключается записью с проверкой.
+//   Слоты в NVS: pp1..pp3 - копии профилей, ppu - автокопия перед восстановлением.
+// =====================================================================
+#define SHFW_PROF_WORDS 59
+#define SHFW_PROF_BYTES (SHFW_PROF_WORDS * 2)
+#define SHFW_PROF_LAYOUT 0x5001           // менять при смене границ профилей: старые копии станут недействительными
+static const uint8_t SHFW_PROF_FROM[3] = {0x01, 0x3C, 0x77};
+
+struct __attribute__((packed)) ShfwProfHdr {
+  char magic[2]; uint8_t fmt, profile, verLen; uint8_t ver[SHFW_VER_MAX];
+  uint16_t layout, words; uint8_t okMask[(SHFW_PROF_WORDS + 7) / 8]; uint16_t crc;
+};
+static uint8_t shfwProfBlob[sizeof(ShfwProfHdr) + SHFW_PROF_BYTES];
+static uint8_t shfwProfBuf[SHFW_PROF_BYTES];
+static uint8_t shfwProfOk[SHFW_PROF_WORDS];
+
+static void shfwProfSlotKey(uint8_t i, char* k) {
+  if (i < 3) snprintf(k, 8, "pp%d", i + 1); else snprintf(k, 8, "ppu");
+}
+
+static uint16_t shfwProfCrc(const ShfwProfHdr& h, const uint8_t* body) {
+  return shfwCrc16(body, SHFW_PROF_BYTES, shfwCrc16((const uint8_t*)&h, sizeof(h) - sizeof(uint16_t)));
+}
+
+// Читает профиль p (1-3). Возвращает число прочитанных слов; нечитаемые слова обнуляются.
+static uint16_t shfwProfRead(uint8_t p, uint8_t* buf, uint8_t* ok) {
+  const uint16_t CHUNK = SHFW_MAX_XFER / 2;                       // 40 слов
+  for (uint16_t a = 0; a < SHFW_PROF_WORDS; a += CHUNK)
+    shfwReadWords(SHFW_PROF_FROM[p - 1] + a, (SHFW_PROF_WORDS - a) < CHUNK ? (SHFW_PROF_WORDS - a) : CHUNK, buf + a * 2, ok + a);
+  uint16_t got = 0;
+  for (uint16_t i = 0; i < SHFW_PROF_WORDS; i++) got += ok[i] ? 1 : 0;
+  return got;
+}
+
+// 1 - слот годен, 0 - пуст, -1 - повреждён или от другой раскладки.
+static int shfwProfSlotLoad(uint8_t i, ShfwProfHdr* hdr, uint8_t* body) {
+  char k[8];
+  shfwProfSlotKey(i, k);
+  if (!shfwPrefs.begin("shfwbak", true)) return 0;
+  size_t n = shfwPrefs.getBytesLength(k);
+  int res = 0;
+  if (n) {
+    res = -1;
+    if (n == sizeof(shfwProfBlob) && shfwPrefs.getBytes(k, shfwProfBlob, n) == n) {
+      ShfwProfHdr h;
+      memcpy(&h, shfwProfBlob, sizeof(h));
+      const uint8_t* b = shfwProfBlob + sizeof(h);
+      if (h.magic[0] == 'S' && h.magic[1] == 'P' && h.fmt == 1 && h.profile >= 1 && h.profile <= 3 &&
+          (i >= 3 || h.profile == i + 1) && h.verLen > 0 && h.verLen <= SHFW_VER_MAX &&
+          h.layout == SHFW_PROF_LAYOUT && h.words == SHFW_PROF_WORDS && h.crc == shfwProfCrc(h, b)) {
+        if (hdr) *hdr = h;
+        if (body) memcpy(body, b, SHFW_PROF_BYTES);
+        res = 1;
+      }
+    }
+  }
+  shfwPrefs.end();
+  return res;
+}
+
+// Версия - из shfwVer (должна быть прочитана), данные - из buf, маска - из ok.
+static bool shfwProfSlotSave(uint8_t i, uint8_t profile, const uint8_t* buf, const uint8_t* ok) {
+  if (!shfwVerLen) return false;
+  ShfwProfHdr h = {};
+  h.magic[0] = 'S'; h.magic[1] = 'P'; h.fmt = 1; h.profile = profile; h.verLen = shfwVerLen;
+  memcpy(h.ver, shfwVer, shfwVerLen);
+  h.layout = SHFW_PROF_LAYOUT; h.words = SHFW_PROF_WORDS;
+  for (uint16_t w = 0; w < SHFW_PROF_WORDS; w++) if (ok[w]) h.okMask[w >> 3] |= (uint8_t)(1U << (w & 7));
+  uint8_t* body = shfwProfBlob + sizeof(h);
+  memcpy(body, buf, SHFW_PROF_BYTES);
+  h.crc = shfwProfCrc(h, body);
+  memcpy(shfwProfBlob, &h, sizeof(h));
+  char k[8];
+  shfwProfSlotKey(i, k);
+  if (!shfwPrefs.begin("shfwbak", false)) return false;
+  bool res = shfwPrefs.putBytes(k, shfwProfBlob, sizeof(shfwProfBlob)) == sizeof(shfwProfBlob);
+  shfwPrefs.end();
+  return res;
+}
+
+static void shfwProfRefresh() {
+  for (uint8_t i = 0; i < 4; i++) {
+    ShfwProfHdr h;
+    shfwPSlots[i].valid = shfwProfSlotLoad(i, &h, nullptr) == 1;
+    shfwPSlots[i].profile = shfwPSlots[i].valid ? h.profile : 0;
+    shfwPSlots[i].verLen = shfwPSlots[i].valid ? h.verLen : 0;
+    if (shfwPSlots[i].valid) memcpy(shfwPSlots[i].ver, h.ver, h.verLen);
+  }
+}
+
+// Копия профиля slot+1 в слот slot (0-2). Только чтение из самоката.
+static ShfwBakResult shfwProfBackup(uint8_t slot) {
+  if (slot >= 3) return BK_RESERVED;
+  if (!shfwLive()) return BK_NO_LINK;
+  if (shfwDetected != 1 && !shfwDetect()) return BK_NOT_SHFW;
+  if (!shfwReadVersion()) return BK_NO_VERSION;
+  shfwProfGot = shfwProfRead(slot + 1, shfwProfBuf, shfwProfOk);
+  if (!shfwProfGot) return BK_READ_FAIL;
+  return shfwProfSlotSave(slot, slot + 1, shfwProfBuf, shfwProfOk) ? BK_OK : BK_SAVE_FAIL;
+}
+
+// Восстановление слота (0-3) в тот профиль, из которого он снят. Пишутся только отличающиеся слова,
+// каждый блок читается обратно и сверяется. Перед записью текущий профиль уходит в слот Отмена.
+static ShfwBakResult shfwProfRestore(uint8_t slot) {
+  static uint8_t saved[SHFW_PROF_BYTES], cur[SHFW_PROF_BYTES];
+  static uint8_t curOk[SHFW_PROF_WORDS];
+  static bool need[SHFW_PROF_WORDS];
+  if (slot > 3) return BK_BAD_SLOT;
+  if (!shfwEnabled) return BK_LOCKED;
+  if (!shfwLive()) return BK_NO_LINK;
+  if (!(d.valid & (1U << SPEED)) || d.speed > 1.0f) return BK_MOVING;
+  if (shfwDetected != 1 && !shfwDetect()) return BK_NOT_SHFW;
+  if (!shfwReadVersion()) return BK_NO_VERSION;
+  ShfwProfHdr h;
+  int ld = shfwProfSlotLoad(slot, &h, saved);
+  if (ld == 0) return BK_EMPTY;
+  if (ld < 0) return BK_BAD_SLOT;
+  shfwSavedVerLen = h.verLen;
+  memcpy(shfwSavedVer, h.ver, h.verLen);
+  if (h.verLen != shfwVerLen || memcmp(h.ver, shfwVer, shfwVerLen) != 0) return BK_VER_MISMATCH;
+  uint8_t p = h.profile;
+  if (!shfwProfRead(p, cur, curOk)) return BK_READ_FAIL;
+  uint16_t nNeed = 0;
+  for (uint16_t w = 0; w < SHFW_PROF_WORDS; w++) {
+    bool valid = (h.okMask[w >> 3] >> (w & 7)) & 1;
+    need[w] = valid && curOk[w] && memcmp(saved + w * 2, cur + w * 2, 2) != 0;
+    nNeed += need[w] ? 1 : 0;
+  }
+  if (!nNeed) return BK_NOCHANGE;                          // ничего не пишем и Отмену не трогаем
+  if (slot != 3 && !shfwProfSlotSave(3, p, cur, curOk)) return BK_SAVE_FAIL;
+  const uint16_t CHUNK = SHFW_MAX_XFER / 2;
+  uint8_t tmp[SHFW_MAX_XFER];
+  shfwBakFailCount = 0;
+  for (uint16_t w = 0; w < SHFW_PROF_WORDS;) {
+    if (!need[w]) { w++; continue; }
+    uint16_t e = w;
+    while (e < SHFW_PROF_WORDS && need[e] && (e - w) < CHUNK) e++;
+    uint8_t reg = (uint8_t)(SHFW_PROF_FROM[p - 1] + w), bytes = (uint8_t)((e - w) * 2);
+    bool ok = shfwWriteBlock(reg, saved + w * 2, bytes) && shfwReadBlock(reg, bytes, tmp) &&
+              memcmp(tmp, saved + w * 2, bytes) == 0;
+    Serial.printf("SHFW profile %u restore reg=%02X bytes=%u %s\n", p, reg, bytes, ok ? "ok" : "FAIL");
+    if (!ok) { if (!shfwBakFailCount) shfwBakFailReg = reg; shfwBakFailCount++; }
+    w = e;
+  }
+  memset(shfwHave, 0, sizeof(shfwHave));                   // кэш редактора устарел
+  return shfwBakFailCount ? BK_WRITE_FAIL : BK_OK;
+}
+
+// Переключение активного профиля (регистр 0xB2) - через общую запись с проверкой.
+static ShfwResult shfwProfSwitch(uint8_t p) {
+  const ShfwItem* it = nullptr;
+  for (uint16_t i = 0; i < SHFW_ITEM_COUNT; i++) if (SHFW_ITEMS[i].reg == 0xB2) { it = &SHFW_ITEMS[i]; break; }
+  if (!it || p < 1 || p > 3) return SW_READ_FAIL;
+  ShfwResult r = shfwWriteItem(*it, p);
+  if (r == SW_OK) { shfwProfActive = p; shfwProfile = p; memset(shfwHave, 0, sizeof(shfwHave)); }
+  return r;
+}
+
 void shfwOpenRoot() {
   memset(shfwHave, 0, sizeof(shfwHave));
   shfwDetected = -1;
@@ -2423,6 +2719,7 @@ static void shfwBakMessage(ShfwBakResult r, bool restore) {
       snprintf(mb, sizeof(mb), "%s %s / %s %s", TR("VERSION DIFFERS: saved", "ВЕРСИЯ ДРУГАЯ: в копии"), a, TR("now", "сейчас"), b);
       shfwSetMsg(COL_BAD, mb);
       break;
+    case BK_NOCHANGE: break;
     case BK_WRITE_FAIL:
       snprintf(mb, sizeof(mb), "%u %s %02X. %s", shfwBakFailCount, TR("block(s) not applied, first at reg", "блок(ов) не принято, первый с рег."),
                shfwBakFailReg, TR("Previous settings: UNDO slot", "Прежние: слот Отмена"));
@@ -2444,6 +2741,83 @@ void shfwDoRestore() {
   ShfwBakResult r = shfwRestore(shfwBakSel);
   shfwRefreshSlots();
   shfwBakMessage(r, true);
+  uiMode = -1;
+}
+
+// ---------- экран «Профили»: действия ----------
+void shfwOpenProf() {
+  shfwMsg[0] = 0;
+  shfwProfActive = 0;
+  if (shfwLive()) {
+    shfwBusy(TR("Reading profile...", "Чтение профиля..."));
+    shfwReadVersion();
+    uint16_t w;
+    if (shfwReadReg(0xB2, 2, w)) {
+      uint8_t p = (uint8_t)(w & 0xFF);
+      if (p >= 1 && p <= 3) { shfwProfActive = p; shfwProfile = p; }
+    }
+  } else shfwVerLen = 0;
+  shfwProfSel = shfwProfActive ? shfwProfActive - 1 : 0;
+  shfwProfRefresh();
+  goScr(S_SHFW_PROF);
+}
+
+static void shfwProfMessage(ShfwBakResult r, bool restore) {
+  char mb[120];
+  if (r == BK_OK) {
+    if (restore) shfwSetMsg(COL_GOOD, TR("Profile restored and verified. Previous state is in the UNDO slot.", "Профиль восстановлен и проверен. Прежний - в слоте Отмена."));
+    else if (shfwProfGot < SHFW_PROF_WORDS) {
+      snprintf(mb, sizeof(mb), "%s %u/%u", TR("Saved, words read:", "Сохранено, прочитано слов:"), shfwProfGot, (unsigned)SHFW_PROF_WORDS);
+      shfwSetMsg(COL_WARN, mb);
+    } else {
+      snprintf(mb, sizeof(mb), "%s %d", TR("Saved profile", "Сохранён профиль"), shfwProfSel + 1);
+      shfwSetMsg(COL_GOOD, mb);
+    }
+  } else if (r == BK_NOCHANGE) {
+    shfwSetMsg(COL_GOOD, TR("Profile already matches the backup - nothing written", "Профиль уже совпадает с копией - ничего не записано"));
+  } else shfwBakMessage(r, restore);
+}
+
+void shfwDoProfSwitch() {
+  if (shfwProfSel > 2) { shfwSetMsg(COL_WARN, TR("Select profile 1-3", "Выберите профиль 1-3")); uiMode = -1; return; }
+  uint8_t p = (uint8_t)(shfwProfSel + 1);
+  shfwBusy(TR("Switching profile...", "Переключение профиля..."));
+  ShfwResult r = shfwProfSwitch(p);
+  char mb[96];
+  switch (r) {
+    case SW_OK:
+      snprintf(mb, sizeof(mb), "%s %d", TR("Active profile:", "Активный профиль:"), p);
+      shfwSetMsg(COL_GOOD, mb);
+      break;
+    case SW_LOCKED:   shfwSetMsg(COL_WARN, TR("Editing is OFF (SHFW menu: hold)", "Правка выключена (меню SHFW)")); break;
+    case SW_NO_LINK:  shfwSetMsg(COL_BAD, TR("No link to the scooter", "Нет связи с самокатом")); break;
+    case SW_MOVING:   shfwSetMsg(COL_WARN, TR("Stop the scooter first", "Сначала остановите самокат")); break;
+    case SW_NOT_SHFW: shfwSetMsg(COL_BAD, TR("SHFW not detected - nothing written", "SHFW не найдена - запись не выполнена")); break;
+    case SW_READ_FAIL: shfwSetMsg(COL_BAD, TR("Read failed - nothing written", "Чтение не удалось - ничего не записано")); break;
+    case SW_VERIFY_FAIL: {
+      uint16_t w;
+      if (shfwReadReg(0xB2, 2, w) && (w & 0xFF) >= 1 && (w & 0xFF) <= 3) shfwProfActive = (uint8_t)(w & 0xFF);
+      shfwSetMsg(COL_BAD, TR("Not applied - check the active profile", "Не принято - проверьте активный профиль"));
+      break;
+    }
+  }
+  uiMode = -1;
+}
+
+void shfwDoProfBackup() {
+  if (shfwProfSel > 2) { shfwSetMsg(COL_WARN, TR("UNDO slot is filled automatically", "Слот Отмена заполняется автоматически")); uiMode = -1; return; }
+  shfwBusy(TR("Reading profile...", "Чтение профиля..."));
+  ShfwBakResult r = shfwProfBackup((uint8_t)shfwProfSel);
+  shfwProfRefresh();
+  shfwProfMessage(r, false);
+  uiMode = -1;
+}
+
+void shfwDoProfRestore() {
+  shfwBusy(TR("Restoring profile...", "Восстановление профиля..."));
+  ShfwBakResult r = shfwProfRestore((uint8_t)shfwProfSel);
+  shfwProfRefresh();
+  shfwProfMessage(r, true);
   uiMode = -1;
 }
 
@@ -2510,6 +2884,7 @@ void goBack() {
     case S_CAL: if (cfg.cal.valid) goScr(calFromBoot ? S_MAIN : S_SET); break;
     case S_SHFW_EDIT: goScr(S_SHFW_LIST); break;
     case S_SHFW_BAK: goScr(S_SHFW); break;
+    case S_SHFW_PROF: goScr(S_SHFW); break;
     case S_SHFW_LIST: goScr(S_SHFW); break;
     default: goScr(S_SET); break;
   }
@@ -2756,8 +3131,9 @@ void touchSettings() {
       if (tch.evLong && hit(x, y, 8, 50, 224, 40)) { shfwEnabled = !shfwEnabled; uiMode = -1; break; }
       if (!tch.evTap) break;
       for (uint8_t g = 0; g < SG_COUNT; g++)
-        if (hit(x, y, 8, 98 + g * 28, 224, 25)) { shfwOpenGroup(g); return; }
-      if (hit(x, y, 8, 98 + SG_COUNT * 28, 224, 25)) shfwOpenBak();
+        if (hit(x, y, 8, 98 + g * 25, 224, 22)) { shfwOpenGroup(g); return; }
+      if (hit(x, y, 8, 98 + SG_COUNT * 25, 224, 22)) { shfwOpenProf(); return; }
+      if (hit(x, y, 8, 98 + (SG_COUNT + 1) * 25, 224, 22)) shfwOpenBak();
       break;
 
     case S_SHFW_BAK:
@@ -2770,6 +3146,23 @@ void touchSettings() {
         if (shfwBakSel < SHFW_UNDO_SLOT && !shfwSlots[shfwBakSel].valid) shfwDoBackup();       // пустой слот - сразу
         else { shfwSetMsg(COL_WARN, TR("Hold BACKUP to overwrite the slot", "Удерживайте КОПИЯ для замены слота")); uiMode = -1; }
       } else if (hit(x, y, 124, 234, 108, 40)) {
+        shfwSetMsg(COL_WARN, TR("Hold RESTORE to confirm", "Удерживайте ВОССТАНОВИТЬ")); uiMode = -1;
+      }
+      break;
+
+    case S_SHFW_PROF:
+      if (tch.evLong && hit(x, y, 8, 194, 108, 40)) { shfwDoProfSwitch(); return; }
+      if (tch.evLong && hit(x, y, 124, 194, 108, 40)) { shfwDoProfBackup(); return; }
+      if (tch.evLong && hit(x, y, 8, 238, 224, 34)) { shfwDoProfRestore(); return; }
+      if (!tch.evTap) break;
+      for (int i = 0; i < 4; i++)
+        if (hit(x, y, 8, 48 + i * 36, 224, 33)) { shfwProfSel = i; shfwMsg[0] = 0; uiMode = -1; return; }
+      if (hit(x, y, 8, 194, 108, 40)) {
+        shfwSetMsg(COL_WARN, TR("Hold SWITCH to change the active profile", "Удерживайте ВКЛЮЧИТЬ для смены профиля")); uiMode = -1;
+      } else if (hit(x, y, 124, 194, 108, 40)) {
+        if (shfwProfSel < 3 && !shfwPSlots[shfwProfSel].valid) shfwDoProfBackup();             // пустой слот - сразу
+        else { shfwSetMsg(COL_WARN, TR("Hold BACKUP to overwrite the backup", "Удерживайте КОПИЯ для замены копии")); uiMode = -1; }
+      } else if (hit(x, y, 8, 238, 224, 34)) {
         shfwSetMsg(COL_WARN, TR("Hold RESTORE to confirm", "Удерживайте ВОССТАНОВИТЬ")); uiMode = -1;
       }
       break;
@@ -2996,6 +3389,10 @@ void loop() {
   static int idx = 0;
   static bool pollBrakeCurrent = false;
   handleButton();
+  if (Serial.available()) {                  // 'f' - полное чтение конфига ESC (только чтение)
+    int ch = Serial.read();
+    if (ch == 'f' || ch == 'F') shfwFullScan();
+  }
   handleTouch();
   serviceOtaWeb();
   housekeeping();

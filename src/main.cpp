@@ -102,7 +102,15 @@ struct ShfwRx { volatile bool pending, ok; volatile uint8_t reg, len; uint8_t da
 // Ответ на запрос версии SHFW: 5A A5 00 3E 20 39 00 68 FF (dst=ESC, cmd=0x39, arg=0). Формат ответа сохраняется как есть.
 struct ShfwVerRx { volatile bool pending, ok; volatile uint8_t len; uint8_t data[SHFW_VER_MAX]; } shfwVerRx;
 
-enum LedEffect : uint8_t { LED_OFF, LED_SOLID, LED_PULSE, LED_RAINBOW, LED_EFFECT_COUNT };
+// Эффекты ARGB-ленты. Значения 0..3 совпадают с прошлыми выпусками,
+// поэтому настройки из NVS читаются без миграции.
+enum LedEffect : uint8_t {
+  LED_OFF, LED_SOLID, LED_PULSE, LED_RAINBOW,
+  LED_BLINK, LED_BREATH, LED_CHASE, LED_COMET,
+  LED_TWINKLE, LED_GRADIENT, LED_BOUNCE, LED_FILL,
+  LED_EFFECT_COUNT
+};
+#define LED_EFFECT_COUNT_V1 4      // в старом формате настроек было всего 4 эффекта
 enum LedBrake : uint8_t { LED_BRAKE_OFF, LED_BRAKE_ALL, LED_BRAKE_REAR, LED_BRAKE_COUNT };
 struct LedSettings {
   uint8_t enabled = 0, pinIndex = 3, count = 30;
@@ -126,8 +134,16 @@ static const uint32_t LED_COLORS[] = {
   0x00C8FF, 0x4678FF, 0xAA5AFF, 0xFF50AA,
   0xFF4646, 0xFF8C1E, 0xFFD228, 0x3CE178
 };
-static const char* const LED_EFFECT_NAMES[] = {"OFF", "SOLID", "PULSE", "RAINBOW"};
-static const char* const LED_EFFECT_NAMES_RU[] = {"ВЫКЛ", "ЦВЕТ", "ПУЛЬС", "РАДУГА"};
+static const char* const LED_EFFECT_NAMES[] = {
+  "OFF", "SOLID", "PULSE", "RAINBOW",
+  "BLINK", "BREATH", "CHASE", "COMET",
+  "TWINKLE", "GRADIENT", "BOUNCE", "FILL"
+};
+static const char* const LED_EFFECT_NAMES_RU[] = {
+  "ВЫКЛ", "ЦВЕТ", "ПУЛЬС", "РАДУГА",
+  "МИГАН", "ДЫХАН", "БЕГУН", "КОМЕТА",
+  "ИСКРЫ", "ГРАДИЕНТ", "ОТСКОК", "ЗАЛИВКА"
+};
 static const char* const LED_BRAKE_NAMES[] = {"OFF", "ALL", "REAR SEG"};
 static const char* const LED_BRAKE_NAMES_RU[] = {"ВЫКЛ", "ВСЯ ЛЕНТА", "ЗАДНИЙ СЕГМЕНТ"};
 
@@ -138,6 +154,7 @@ static uint32_t brakeUntil = 0;
 static uint8_t ledColorSeg = 0;                 // сегмент, который сейчас выбирают
 static uint16_t ledColorHue0 = 0;               // цвет до правки (для отмены)
 static uint8_t ledColorSat0 = 0, ledColorVal0 = 0;
+static uint8_t ledEffectSeg = 0;                // сегмент, для которого выбирают эффект
 
 // ---------- Цвета ARGB-ленты (HSV, как в NeoPixel) ----------
 uint16_t ledSegmentStart(uint8_t segment) {
@@ -1307,7 +1324,7 @@ void loadLedSettings() {
       bool valid = true;
       for (uint8_t i = 0; i < 3; i++) {
         t.segmentCount[i] = old.segmentCount[i];
-        t.effect[i] = old.effect[i] < LED_EFFECT_COUNT ? old.effect[i] : LED_OFF;
+        t.effect[i] = old.effect[i] < LED_EFFECT_COUNT_V1 ? old.effect[i] : LED_OFF;
         uint8_t ci = old.color[i] % (sizeof(LED_COLORS) / sizeof(LED_COLORS[0]));
         uint32_t rgb = LED_COLORS[ci];
         rgbToHsv((rgb >> 16) & 0xFF, (rgb >> 8) & 0xFF, rgb & 0xFF, t.hue[i], t.sat[i], t.val[i]);
@@ -1338,6 +1355,138 @@ void saveLedSettings() {
   if (saved != sizeof(ledCfg)) Serial.println("ERROR: failed to save LED settings");
 }
 
+// ---------- Эффекты ARGB-ленты ----------
+static inline uint32_t ledScaleRgb(uint32_t rgb, float level) {
+  if (level <= 0.0f) return 0;
+  if (level > 1.0f) level = 1.0f;
+  return ledStrip.Color(
+    (uint8_t)(((rgb >> 16) & 0xFF) * level),
+    (uint8_t)(((rgb >> 8) & 0xFF) * level),
+    (uint8_t)((rgb & 0xFF) * level));
+}
+// Детерминированный шум для мерцания: без rand(), чтобы картинка не дрожала между кадрами.
+static inline uint32_t ledHash(uint32_t x) {
+  x ^= x >> 16; x *= 0x7feb352dUL;
+  x ^= x >> 15; x *= 0x846ca68bUL;
+  x ^= x >> 16;
+  return x;
+}
+
+// Рисует один сегмент ленты выбранным эффектом.
+void ledRenderSegment(uint8_t segment, uint16_t start, uint16_t end, uint32_t now, bool brakeHere) {
+  uint16_t len = end - start;
+  if (!len) return;
+  uint8_t effect = ledCfg.effect[segment] < LED_EFFECT_COUNT ? ledCfg.effect[segment] : LED_OFF;
+  uint16_t hue = ledCfg.hue[segment];
+  uint8_t sat = ledCfg.sat[segment], val = ledCfg.val[segment];
+  uint32_t base = ledColorRgb(hue, sat, val);
+  uint32_t t = now + segment * 137UL;    // свой сдвиг фазы: куски не идут в ногу
+
+  if (brakeHere) {
+    for (uint16_t p = start; p < end; p++) ledStrip.setPixelColor(p, ledStrip.Color(255, 0, 0));
+    return;
+  }
+
+  switch (effect) {
+    case LED_SOLID:
+      for (uint16_t p = start; p < end; p++) ledStrip.setPixelColor(p, base);
+      break;
+
+    case LED_PULSE: {
+      float phase = (sinf(now * 0.004f) + 1.0f) * 0.5f;
+      uint32_t c = ledScaleRgb(base, 0.12f + phase * 0.88f);
+      for (uint16_t p = start; p < end; p++) ledStrip.setPixelColor(p, c);
+      break;
+    }
+
+    case LED_RAINBOW:
+      for (uint16_t p = start; p < end; p++)
+        ledStrip.setPixelColor(p, ledStrip.ColorHSV((uint16_t)(now * 12 + p * 65535UL / ledCfg.count)));
+      break;
+
+    case LED_BLINK: {
+      uint32_t c = ((t / 250) & 1) ? 0 : base;
+      for (uint16_t p = start; p < end; p++) ledStrip.setPixelColor(p, c);
+      break;
+    }
+
+    case LED_BREATH: {
+      float u = (float)(t % 4000UL) / 4000.0f;
+      float tri = u < 0.5f ? u * 2.0f : (1.0f - u) * 2.0f;
+      float s = tri * tri * (3.0f - 2.0f * tri);          // сглаженный треугольник
+      uint32_t c = ledScaleRgb(base, 0.05f + s * 0.95f);
+      for (uint16_t p = start; p < end; p++) ledStrip.setPixelColor(p, c);
+      break;
+    }
+
+    case LED_CHASE: {
+      uint16_t pos = (uint16_t)((t / 70) % len);
+      for (uint16_t i = 0; i < len; i++) {
+        uint16_t d = (uint16_t)((i + len - pos) % len);
+        float lvl = d < 8 ? 1.0f - (float)d / 8.0f : 0.0f;
+        ledStrip.setPixelColor(start + i, ledScaleRgb(base, lvl));
+      }
+      break;
+    }
+
+    case LED_COMET: {
+      uint16_t pos = (uint16_t)((t / 55) % len);
+      for (uint16_t i = 0; i < len; i++) {
+        uint16_t d = (uint16_t)((i + len - pos) % len);
+        float x = d < 24 ? 1.0f - (float)d / 24.0f : 0.0f;
+        ledStrip.setPixelColor(start + i, ledScaleRgb(base, x * x));
+      }
+      break;
+    }
+
+    case LED_TWINKLE: {
+      uint32_t tick = t / 90;
+      for (uint16_t i = 0; i < len; i++) {
+        uint32_t seed = ledHash((uint32_t)(i + 1) * 2654435761UL);
+        uint32_t period = 6UL + (seed % 18UL);
+        uint32_t phase = (tick + ((seed >> 8) % period)) % period;
+        float lvl = phase == 0 ? 1.0f : (phase == 1 ? 0.45f : (phase == 2 ? 0.12f : 0.0f));
+        ledStrip.setPixelColor(start + i, ledScaleRgb(base, lvl));
+      }
+      break;
+    }
+
+    case LED_GRADIENT: {
+      for (uint16_t i = 0; i < len; i++) {
+        uint16_t h2 = (uint16_t)((hue + (uint32_t)i * 120UL / len) % 360UL);
+        ledStrip.setPixelColor(start + i, ledColorRgb(h2, sat, val));
+      }
+      break;
+    }
+
+    case LED_BOUNCE: {
+      uint16_t pos;
+      if (len <= 1) pos = 0;
+      else {
+        uint32_t period = (uint32_t)(len - 1) * 2UL;
+        uint32_t step = (t / 70) % (period + 1);
+        pos = (uint16_t)(step <= len - 1 ? step : period - step);
+      }
+      for (uint16_t i = 0; i < len; i++)
+        ledStrip.setPixelColor(start + i, ledScaleRgb(base, i == pos ? 1.0f : 0.0f));
+      break;
+    }
+
+    case LED_FILL: {
+      uint32_t step = (t / 60) % ((uint32_t)len * 2UL);
+      uint32_t filled = step < len ? step : (uint32_t)len * 2UL - step;
+      for (uint16_t i = 0; i < len; i++) {
+        float lvl = i < filled ? 1.0f : (i == filled ? 0.45f : 0.0f);
+        ledStrip.setPixelColor(start + i, ledScaleRgb(base, lvl));
+      }
+      break;
+    }
+
+    default:
+      break;   // LED_OFF и всё нераспознанное: сегмент не горит
+  }
+}
+
 void serviceLedStrip() {
   static uint32_t lastFrame = 0;
   static bool wasLit = false;
@@ -1365,29 +1514,7 @@ void serviceLedStrip() {
   for (uint8_t segment = 0; segment < 3; segment++) {
     uint16_t start = ledSegmentStart(segment);
     uint16_t end = min((uint16_t)ledCfg.count, (uint16_t)(start + ledCfg.segmentCount[segment]));
-    bool brakeHere = brakeAll || (int)segment == brakeSeg;
-    uint16_t hue = ledCfg.hue[segment];
-    uint8_t sat = ledCfg.sat[segment], val = ledCfg.val[segment];
-    for (uint16_t pixel = start; pixel < end; pixel++) {
-      uint32_t color = 0;
-      uint8_t effect = ledCfg.effect[segment];
-      if (brakeHere) {
-        color = ledStrip.Color(255, 0, 0);
-      } else if (effect == LED_SOLID) {
-        color = ledColorRgb(hue, sat, val);
-      } else if (effect == LED_PULSE) {
-        float phase = (sinf(now * 0.004f) + 1.0f) * 0.5f;
-        float level = 0.12f + phase * 0.88f;
-        uint32_t base = ledColorRgb(hue, sat, val);
-        color = ledStrip.Color(
-          (uint8_t)(((base >> 16) & 0xFF) * level),
-          (uint8_t)(((base >> 8) & 0xFF) * level),
-          (uint8_t)((base & 0xFF) * level));
-      } else if (effect == LED_RAINBOW) {
-        color = ledStrip.ColorHSV((uint16_t)(now * 12 + pixel * 65535UL / ledCfg.count));
-      }
-      ledStrip.setPixelColor(pixel, color);
-    }
+    ledRenderSegment(segment, start, end, now, brakeAll || (int)segment == brakeSeg);
   }
   ledStrip.show();
 }
@@ -1404,7 +1531,7 @@ void nextPage(int dir) {
 }
 
 // ---------- Экраны ----------
-enum Scr : uint8_t { S_MAIN, S_SET, S_APPEAR, S_DISPLAY, S_GAUGE, S_WIDGETS, S_LED, S_LED_COLOR, S_OTA, S_PICK, S_CAL,
+enum Scr : uint8_t { S_MAIN, S_SET, S_APPEAR, S_DISPLAY, S_GAUGE, S_WIDGETS, S_LED, S_LED_COLOR, S_LED_EFFECT, S_OTA, S_PICK, S_CAL,
                      S_SHFW, S_SHFW_LIST, S_SHFW_EDIT, S_SHFW_BAK, S_SHFW_PROF };
 static Scr scr = S_MAIN;
 static Scr pickReturn = S_WIDGETS;
@@ -2353,6 +2480,17 @@ void drawSettingsScreen() {
       secLabel(8, 298, TR("Drag the square = saturation/brightness.", "Квадрат: насыщенность и яркость."));
       break;
     }
+    case S_LED_EFFECT: {
+      char hb[40];
+      snprintf(hb, sizeof(hb), TR("EFFECT OF SEGMENT %d", "ЭФФЕКТ СЕГМЕНТА %d"), ledEffectSeg + 1);
+      settingsHeader(hb);
+      for (int i = 0; i < LED_EFFECT_COUNT; i++) {
+        int col = i % 2, row = i / 2;
+        const char* nm = cfg.lang ? LED_EFFECT_NAMES_RU[i] : LED_EFFECT_NAMES[i];
+        btn(8 + col * 116, 34 + row * 44, 108, 38, nm, ledCfg.effect[ledEffectSeg] == (uint8_t)i, 1);
+      }
+      break;
+    }
     case S_OTA: {
       settingsHeader(TR("WEB FIRMWARE UPDATE", "Обновление по Wi-Fi"));
       secLabel(8, 40, TR("WEB UPDATE ACCESS", "ДОСТУП К ОБНОВЛЕНИЮ"));
@@ -3054,6 +3192,7 @@ void goBack() {
     case S_PICK: if (pickReturn == S_MAIN) leaveSettings(); else goScr(S_WIDGETS); break;
     case S_CAL: if (cfg.cal.valid) goScr(calFromBoot ? S_MAIN : S_SET); break;
     case S_LED_COLOR: saveLedSettings(); goScr(S_LED); break;
+    case S_LED_EFFECT: goScr(S_LED); break;
     case S_SHFW_EDIT: goScr(S_SHFW_LIST); break;
     case S_SHFW_BAK: goScr(S_SHFW); break;
     case S_SHFW_PROF: goScr(S_SHFW); break;
@@ -3307,7 +3446,9 @@ void touchSettings() {
             for (uint8_t j = 0; j < 3; j++) allocated += ledCfg.segmentCount[j];
             if (allocated < ledCfg.count) ledCfg.segmentCount[i]++;
           } else if (hit(x, y, 114, rowY + 20, 68, 21)) {
-            ledCfg.effect[i] = (ledCfg.effect[i] + 1) % LED_EFFECT_COUNT;
+            ledEffectSeg = i;
+            goScr(S_LED_EFFECT);
+            return;
           } else if (hit(x, y, 196, rowY + 20, 32, 21)) {
             ledColorSeg = i;
             ledColorHue0 = ledCfg.hue[i];
@@ -3466,6 +3607,19 @@ void touchSettings() {
           if (pickReturn == S_MAIN) leaveSettings(); else goScr(S_WIDGETS);
           return;
         }
+      break;
+
+    case S_LED_EFFECT:
+      if (!tch.evTap) break;
+      for (int i = 0; i < LED_EFFECT_COUNT; i++) {
+        int col = i % 2, row = i / 2;
+        if (hit(x, y, 8 + col * 116, 34 + row * 44, 108, 38)) {
+          ledCfg.effect[ledEffectSeg] = (uint8_t)i;
+          saveLedSettings();
+          goScr(S_LED);
+          return;
+        }
+      }
       break;
 
     default: break;

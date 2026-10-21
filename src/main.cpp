@@ -103,12 +103,24 @@ struct ShfwRx { volatile bool pending, ok; volatile uint8_t reg, len; uint8_t da
 struct ShfwVerRx { volatile bool pending, ok; volatile uint8_t len; uint8_t data[SHFW_VER_MAX]; } shfwVerRx;
 
 enum LedEffect : uint8_t { LED_OFF, LED_SOLID, LED_PULSE, LED_RAINBOW, LED_EFFECT_COUNT };
+enum LedBrake : uint8_t { LED_BRAKE_OFF, LED_BRAKE_ALL, LED_BRAKE_REAR, LED_BRAKE_COUNT };
 struct LedSettings {
   uint8_t enabled = 0, pinIndex = 3, count = 30;
   uint8_t segmentCount[3] = {10, 10, 10};
   uint8_t effect[3] = {LED_SOLID, LED_PULSE, LED_RAINBOW};
-  uint8_t color[3] = {0, 7, 1};
+  uint8_t bright = 64;                 // 1..255 - общая яркость ленты
+  uint8_t brake = LED_BRAKE_ALL;       // индикация торможения
+  uint16_t hue[3] = {193, 98, 224};    // 0..359
+  uint8_t sat[3] = {255, 187, 185};    // 0..255
+  uint8_t val[3] = {255, 225, 255};    // 0..255
 } ledCfg;
+// Старый формат настроек ленты: цвет хранился индексом в палитре из 8 цветов.
+struct LedSettingsV1 {
+  uint8_t enabled, pinIndex, count;
+  uint8_t segmentCount[3];
+  uint8_t effect[3];
+  uint8_t color[3];
+};
 
 static const uint32_t LED_COLORS[] = {
   0x00C8FF, 0x4678FF, 0xAA5AFF, 0xFF50AA,
@@ -116,11 +128,45 @@ static const uint32_t LED_COLORS[] = {
 };
 static const char* const LED_EFFECT_NAMES[] = {"OFF", "SOLID", "PULSE", "RAINBOW"};
 static const char* const LED_EFFECT_NAMES_RU[] = {"ВЫКЛ", "ЦВЕТ", "ПУЛЬС", "РАДУГА"};
+static const char* const LED_BRAKE_NAMES[] = {"OFF", "ALL", "REAR SEG"};
+static const char* const LED_BRAKE_NAMES_RU[] = {"ВЫКЛ", "ВСЯ ЛЕНТА", "ЗАДНИЙ СЕГМЕНТ"};
 
 TFT_eSPI tft;
 Adafruit_NeoPixel ledStrip(30, LED_PINS[3], NEO_GRB + NEO_KHZ800);
 static bool ledReady = false;
 static uint32_t brakeUntil = 0;
+static uint8_t ledColorSeg = 0;                 // сегмент, который сейчас выбирают
+static uint16_t ledColorHue0 = 0;               // цвет до правки (для отмены)
+static uint8_t ledColorSat0 = 0, ledColorVal0 = 0;
+
+// ---------- Цвета ARGB-ленты (HSV, как в NeoPixel) ----------
+uint16_t ledSegmentStart(uint8_t segment) {
+  uint16_t start = 0;
+  for (uint8_t i = 0; i < segment; i++) start += ledCfg.segmentCount[i];
+  return start;
+}
+static inline uint32_t ledColorRgb(uint16_t h, uint8_t s, uint8_t v) {
+  return ledStrip.ColorHSV((uint16_t)((uint32_t)(h % 360) * 65535UL / 360), s, v);
+}
+static inline uint16_t ledColor565(uint16_t h, uint8_t s, uint8_t v) {
+  uint32_t c = ledColorRgb(h, s, v);
+  return tft.color565((c >> 16) & 0xFF, (c >> 8) & 0xFF, c & 0xFF);
+}
+// RGB -> HSV (для готовых цветов)
+void rgbToHsv(uint8_t r, uint8_t g, uint8_t b, uint16_t& h, uint8_t& s, uint8_t& v) {
+  uint8_t mx = r > g ? (r > b ? r : b) : (g > b ? g : b);
+  uint8_t mn = r < g ? (r < b ? r : b) : (g < b ? g : b);
+  uint8_t d = mx - mn;
+  v = mx;
+  s = mx ? (uint8_t)((uint16_t)d * 255 / mx) : 0;
+  if (!d) { h = 0; return; }
+  int hh;
+  if (mx == r) hh = ((int)g - (int)b) * 60 / d;
+  else if (mx == g) hh = 120 + ((int)b - (int)r) * 60 / d;
+  else hh = 240 + ((int)r - (int)g) * 60 / d;
+  if (hh < 0) hh += 360;
+  h = (uint16_t)(hh % 360);
+}
 NimBLEClient* client = nullptr;
 NimBLERemoteCharacteristic *txChr = nullptr, *rxChr = nullptr;
 volatile bool connected = false;
@@ -1221,7 +1267,7 @@ void applyLedHardware() {
   ledStrip.setPin(ledPin());
   ledStrip.updateLength(ledCfg.count);
   ledStrip.begin();
-  ledStrip.setBrightness(64);
+  ledStrip.setBrightness(ledCfg.bright ? ledCfg.bright : 1);
   ledStrip.clear();
   ledStrip.show();
   ledReady = true;
@@ -1232,20 +1278,51 @@ void loadLedSettings() {
     Serial.println("ERROR: cannot open LED settings");
     return;
   }
-  if (ledPrefs.getBytesLength("config") == sizeof(ledCfg)) {
+  size_t len = ledPrefs.getBytesLength("config");
+  if (len == sizeof(ledCfg)) {
     LedSettings saved;
     if (ledPrefs.getBytes("config", &saved, sizeof(saved)) == sizeof(saved) &&
         saved.enabled <= 1 && saved.pinIndex < LED_PIN_COUNT &&
-        saved.count >= 1 && saved.count <= LED_MAX_COUNT) {
+        saved.count >= 1 && saved.count <= LED_MAX_COUNT &&
+        saved.bright >= 1 && saved.bright <= 255 &&
+        saved.brake < LED_BRAKE_COUNT) {
       uint16_t allocated = 0;
       bool valid = true;
       for (uint8_t i = 0; i < 3; i++) {
         valid &= saved.segmentCount[i] <= LED_MAX_COUNT;
         valid &= saved.effect[i] < LED_EFFECT_COUNT;
-        valid &= saved.color[i] < sizeof(LED_COLORS) / sizeof(LED_COLORS[0]);
+        valid &= saved.hue[i] < 360;
         allocated += saved.segmentCount[i];
       }
       if (valid && allocated <= saved.count) ledCfg = saved;
+    }
+  } else if (len == sizeof(LedSettingsV1)) {
+    // Миграция со старого формата: цвет был индексом в палитре из 8 цветов
+    LedSettingsV1 old;
+    if (ledPrefs.getBytes("config", &old, sizeof(old)) == sizeof(old) &&
+        old.enabled <= 1 && old.pinIndex < LED_PIN_COUNT &&
+        old.count >= 1 && old.count <= LED_MAX_COUNT) {
+      LedSettings t = ledCfg;
+      uint16_t allocated = 0;
+      bool valid = true;
+      for (uint8_t i = 0; i < 3; i++) {
+        t.segmentCount[i] = old.segmentCount[i];
+        t.effect[i] = old.effect[i] < LED_EFFECT_COUNT ? old.effect[i] : LED_OFF;
+        uint8_t ci = old.color[i] % (sizeof(LED_COLORS) / sizeof(LED_COLORS[0]));
+        uint32_t rgb = LED_COLORS[ci];
+        rgbToHsv((rgb >> 16) & 0xFF, (rgb >> 8) & 0xFF, rgb & 0xFF, t.hue[i], t.sat[i], t.val[i]);
+        valid &= old.segmentCount[i] <= LED_MAX_COUNT;
+        allocated += old.segmentCount[i];
+      }
+      if (valid && allocated <= old.count) {
+        t.enabled = old.enabled;
+        t.pinIndex = old.pinIndex;
+        t.count = old.count;
+        ledCfg = t;
+        size_t written = ledPrefs.putBytes("config", &ledCfg, sizeof(ledCfg));
+        if (written != sizeof(ledCfg)) Serial.println("ERROR: failed to migrate LED settings");
+        else Serial.println("LED settings migrated to the new format");
+      }
     }
   }
   ledPrefs.end();
@@ -1279,26 +1356,29 @@ void serviceLedStrip() {
 
   wasLit = true;
   bool braking = brakeUntil && (int32_t)(brakeUntil - now) > 0;
-  if (braking) {
-    for (uint16_t pixel = 0; pixel < ledCfg.count; pixel++)
-      ledStrip.setPixelColor(pixel, ledStrip.Color(255, 0, 0));
-    ledStrip.show();
-    return;
-  }
+  bool brakeAll = braking && ledCfg.brake == LED_BRAKE_ALL;
+  int brakeSeg = -1;                                   // сегмент, который горит красным
+  if (braking && ledCfg.brake == LED_BRAKE_REAR)
+    for (int i = 2; i >= 0; i--) if (ledCfg.segmentCount[i]) { brakeSeg = i; break; }
+
   ledStrip.clear();
   for (uint8_t segment = 0; segment < 3; segment++) {
-    uint16_t start = 0;
-    for (uint8_t i = 0; i < segment; i++) start += ledCfg.segmentCount[i];
+    uint16_t start = ledSegmentStart(segment);
     uint16_t end = min((uint16_t)ledCfg.count, (uint16_t)(start + ledCfg.segmentCount[segment]));
+    bool brakeHere = brakeAll || (int)segment == brakeSeg;
+    uint16_t hue = ledCfg.hue[segment];
+    uint8_t sat = ledCfg.sat[segment], val = ledCfg.val[segment];
     for (uint16_t pixel = start; pixel < end; pixel++) {
       uint32_t color = 0;
       uint8_t effect = ledCfg.effect[segment];
-      if (effect == LED_SOLID) {
-        color = LED_COLORS[ledCfg.color[segment]];
+      if (brakeHere) {
+        color = ledStrip.Color(255, 0, 0);
+      } else if (effect == LED_SOLID) {
+        color = ledColorRgb(hue, sat, val);
       } else if (effect == LED_PULSE) {
         float phase = (sinf(now * 0.004f) + 1.0f) * 0.5f;
         float level = 0.12f + phase * 0.88f;
-        uint32_t base = LED_COLORS[ledCfg.color[segment]];
+        uint32_t base = ledColorRgb(hue, sat, val);
         color = ledStrip.Color(
           (uint8_t)(((base >> 16) & 0xFF) * level),
           (uint8_t)(((base >> 8) & 0xFF) * level),
@@ -1324,7 +1404,7 @@ void nextPage(int dir) {
 }
 
 // ---------- Экраны ----------
-enum Scr : uint8_t { S_MAIN, S_SET, S_APPEAR, S_DISPLAY, S_GAUGE, S_WIDGETS, S_LED, S_OTA, S_PICK, S_CAL,
+enum Scr : uint8_t { S_MAIN, S_SET, S_APPEAR, S_DISPLAY, S_GAUGE, S_WIDGETS, S_LED, S_LED_COLOR, S_OTA, S_PICK, S_CAL,
                      S_SHFW, S_SHFW_LIST, S_SHFW_EDIT, S_SHFW_BAK, S_SHFW_PROF };
 static Scr scr = S_MAIN;
 static Scr pickReturn = S_WIDGETS;
@@ -1898,14 +1978,84 @@ void drawHueSlider() {
   tft.fillRect(kx - 2, 206, 5, 30, hue565(cfg.hue));
 }
 
-void drawGaugePreview() {
-  for (int i = 0; i < GAUGE_SEGS; i++) tft.fillRect(20 + i * 5, 250, 4, 18, gaugeColor(i));
+// ---------- Экран ARGB-ленты: яркость и выбор цвета ----------
+#define LED_BRIGHT_Y  80            // верх ползунка яркости ленты
+#define SV_X 8
+#define SV_Y 36
+#define SV_W 136
+#define SV_H 112
+#define HUE_X 8
+#define HUE_Y 212
+#define HUE_W 224
+#define HUE_H 32
+
+void drawLedBrightness() {
+  char b[8];
+  secLabel(8, 72, TR("STRIP BRIGHTNESS", "Яркость ленты"));
+  snprintf(b, sizeof(b), "%d%%", (int)ledCfg.bright * 100 / 255);
+  tft.setTextDatum(TR_DATUM);
+  tft.setTextColor(COL_ACCENT, COL_BG);
+  tft.setTextPadding(0);
+  drawS(b, 232, 72, 1);
+  drawSlider(LED_BRIGHT_Y, (ledCfg.bright - 1) / 254.0f);
 }
 
-uint16_t ledSegmentStart(uint8_t segment) {
-  uint16_t start = 0;
-  for (uint8_t i = 0; i < segment; i++) start += ledCfg.segmentCount[i];
-  return start;
+void drawLedSvSquare() {
+  uint16_t row[SV_W];
+  uint16_t hue = ledCfg.hue[ledColorSeg];
+  for (int y = 0; y < SV_H; y++) {
+    uint8_t v = 255 - (uint8_t)((uint32_t)y * 255 / (SV_H - 1));
+    for (int x = 0; x < SV_W; x++) {
+      uint8_t s = (uint8_t)((uint32_t)x * 255 / (SV_W - 1));
+      row[x] = ledColor565(hue, s, v);
+    }
+    tft.pushImage(SV_X, SV_Y + y, SV_W, 1, row);
+  }
+}
+
+void drawLedSvMarker() {
+  int x = SV_X + (int)ledCfg.sat[ledColorSeg] * (SV_W - 1) / 255;
+  int y = SV_Y + (SV_H - 1) - (int)ledCfg.val[ledColorSeg] * (SV_H - 1) / 255;
+  tft.drawCircle(x, y, 7, COL_BG);
+  tft.drawCircle(x, y, 6, COL_TXT);
+}
+
+void drawLedHueStrip() {
+  for (int i = 0; i < HUE_W; i++) tft.drawFastVLine(HUE_X + i, HUE_Y, HUE_H, hue565(i * 359 / (HUE_W - 1)));
+  int kx = HUE_X + (int)ledCfg.hue[ledColorSeg] * (HUE_W - 1) / 359;
+  tft.fillRoundRect(kx - 4, HUE_Y - 2, 9, HUE_H + 4, 3, COL_TXT);
+  tft.fillRect(kx - 2, HUE_Y, 5, HUE_H, hue565(ledCfg.hue[ledColorSeg]));
+}
+
+void drawLedPresets() {
+  for (uint8_t i = 0; i < 8; i++) {
+    uint32_t rgb = LED_COLORS[i];
+    uint16_t c = tft.color565((rgb >> 16) & 0xFF, (rgb >> 8) & 0xFF, rgb & 0xFF);
+    int x = 10 + i * 28;
+    tft.fillRoundRect(x, 168, 26, 26, 4, c);
+    tft.drawRoundRect(x, 168, 26, 26, 4, COL_TRACK);
+  }
+}
+
+void drawLedColorPreview() {
+  uint16_t h = ledCfg.hue[ledColorSeg];
+  uint8_t s = ledCfg.sat[ledColorSeg], v = ledCfg.val[ledColorSeg];
+  uint32_t rgb = ledColorRgb(h, s, v);
+  tft.fillRoundRect(152, 36, 80, 80, 6, ledColor565(h, s, v));
+  tft.drawRoundRect(152, 36, 80, 80, 6, COL_TXT);
+  char b[40];
+  snprintf(b, sizeof(b), "#%02X%02X%02X", (rgb >> 16) & 0xFF, (rgb >> 8) & 0xFF, rgb & 0xFF);
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextColor(COL_TXT, COL_BG);
+  tft.setTextPadding(0);
+  drawS(b, 152, 122, 1);
+  snprintf(b, sizeof(b), TR("H %d  S %d  V %d", "ОТТ %d  Н %d  Я %d"), h, s, v);
+  tft.setTextColor(COL_DIM, COL_BG);
+  drawS(b, 152, 136, 1);
+}
+
+void drawGaugePreview() {
+  for (int i = 0; i < GAUGE_SEGS; i++) tft.fillRect(20 + i * 5, 250, 4, 18, gaugeColor(i));
 }
 
 // ---------- SHFW: состояние экранов и помощники ----------
@@ -2025,8 +2175,9 @@ void drawSettingsScreen() {
                cfg.showInfo ? TR("on", "вкл") : TR("off", "выкл"), cfg.showDebug ? TR("on", "вкл") : TR("off", "выкл"));
       snprintf(sub[4], 56, "%s", cfg.lang ? "Русский (нажмите: English)" : "English (tap: Русский)");
       snprintf(sub[5], 56, "%s", TR("re-map the touch panel (3 taps)", "откалибровать сенсор (3 касания)"));
-      snprintf(sub[6], 56, TR("%d LEDs, GPIO %d, %s", "%d светодиодов, GPIO %d, %s"),
-               (int)ledCfg.count, (int)ledPin(), ledCfg.enabled ? TR("on", "вкл") : TR("off", "выкл"));
+      snprintf(sub[6], 56, TR("%d LEDs, GPIO %d, %d%%, %s", "%d св., GPIO %d, %d%%, %s"),
+               (int)ledCfg.count, (int)ledPin(), (int)ledCfg.bright * 100 / 255,
+               ledCfg.enabled ? TR("on", "вкл") : TR("off", "выкл"));
       snprintf(sub[7], 56, TR("web access %s", "веб-доступ: %s"),
                otaEnabled ? TR("on", "вкл") : TR("off", "выкл"));
       snprintf(sub[8], 56, "%s", TR("custom firmware settings", "настройки прошивки SHFW"));
@@ -2145,18 +2296,23 @@ void drawSettingsScreen() {
     }
     case S_LED: {
       settingsHeader(TR("ARGB LED STRIP", "ARGB-лента"));
-      secLabel(8, 33, TR("TOTAL LEDS", "Всего светодиодов"));
-      btn(8, 44, 58, 30, "-", false, 2);
-      btnText(74, 44, 92, 30, String(ledCfg.count) + " LED", false, 1);
-      btn(174, 44, 58, 30, "+", false, 2);
+      secLabel(8, 30, TR("TOTAL LEDS", "Всего светодиодов"));
+      btn(8, 40, 58, 26, "-", false, 2);
+      btnText(74, 40, 92, 26, String(ledCfg.count) + " LED", false, 1);
+      btn(174, 40, 58, 26, "+", false, 2);
 
-      secLabel(8, 78, TR("DATA PIN (tap to change)", "ПИН ДАННЫХ (нажмите)"));
-      btnText(8, 88, 224, 27, String("GPIO ") + ledPin(), false, 1);
-      btnText(8, 121, 224, 27, ledCfg.enabled ? TR("OUTPUT: ON", "ЛЕНТА: ВКЛ") : TR("OUTPUT: OFF", "ЛЕНТА: ВЫКЛ"),
+      drawLedBrightness();
+
+      btnText(8, 114, 108, 26, String("GPIO ") + ledPin(), false, 1);
+      btnText(124, 114, 108, 26, ledCfg.enabled ? TR("STRIP: ON", "ЛЕНТА: ВКЛ") : TR("STRIP: OFF", "ЛЕНТА: ВЫКЛ"),
               ledCfg.enabled, 1);
+      uint8_t brake = ledCfg.brake < LED_BRAKE_COUNT ? ledCfg.brake : LED_BRAKE_OFF;
+      btnText(8, 146, 224, 26,
+              String(TR("BRAKE LIGHT: ", "ТОРМОЖЕНИЕ: ")) + (cfg.lang ? LED_BRAKE_NAMES_RU[brake] : LED_BRAKE_NAMES[brake]),
+              brake != LED_BRAKE_OFF, 1);
 
       for (uint8_t i = 0; i < 3; i++) {
-        int y = 158 + i * 48;
+        int y = 180 + i * 46;
         uint16_t start = ledSegmentStart(i);
         uint16_t end = start + ledCfg.segmentCount[i];
         tft.fillRoundRect(8, y, 224, 44, 6, COL_PANEL);
@@ -2172,14 +2328,29 @@ void drawSettingsScreen() {
         btnText(45, y + 20, 34, 21, String(ledCfg.segmentCount[i]), false, 1);
         btn(82, y + 20, 28, 21, "+", false, 1);
         uint8_t effect = ledCfg.effect[i] < LED_EFFECT_COUNT ? ledCfg.effect[i] : LED_OFF;
-        btnText(114, y + 20, 76, 21,
+        btnText(114, y + 20, 68, 21,
                 cfg.lang ? LED_EFFECT_NAMES_RU[effect] : LED_EFFECT_NAMES[effect], false, 1);
-        uint8_t colorIndex = ledCfg.color[i] % (sizeof(LED_COLORS) / sizeof(LED_COLORS[0]));
-        uint32_t rgb = LED_COLORS[colorIndex];
-        uint16_t swatch = tft.color565((rgb >> 16) & 0xFF, (rgb >> 8) & 0xFF, rgb & 0xFF);
-        tft.fillRoundRect(196, y + 20, 30, 21, 4, swatch);
-        tft.drawRoundRect(196, y + 20, 30, 21, 4, COL_TXT);
+        tft.fillTriangle(188, y + 27, 194, y + 30, 188, y + 33, COL_DIM);
+        uint16_t swatch = ledColor565(ledCfg.hue[i], ledCfg.sat[i], ledCfg.val[i]);
+        tft.fillRoundRect(196, y + 20, 32, 21, 4, swatch);
+        tft.drawRoundRect(196, y + 20, 32, 21, 4, COL_TXT);
       }
+      break;
+    }
+    case S_LED_COLOR: {
+      char hb[40];
+      snprintf(hb, sizeof(hb), TR("COLOR OF SEGMENT %d", "ЦВЕТ СЕГМЕНТА %d"), ledColorSeg + 1);
+      settingsHeader(hb);
+      drawLedSvSquare();
+      drawLedSvMarker();
+      drawLedColorPreview();
+      secLabel(8, 156, TR("PRESETS", "ГОТОВЫЕ ЦВЕТА"));
+      drawLedPresets();
+      secLabel(8, 200, TR("HUE", "ОТТЕНОК"));
+      drawLedHueStrip();
+      btn(8, 254, 108, 38, TR("DONE", "ГОТОВО"), false, 2);
+      btn(124, 254, 108, 38, TR("CANCEL", "ОТМЕНА"), false, 2);
+      secLabel(8, 298, TR("Drag the square = saturation/brightness.", "Квадрат: насыщенность и яркость."));
       break;
     }
     case S_OTA: {
@@ -2882,6 +3053,7 @@ void goBack() {
     case S_SET: leaveSettings(); break;
     case S_PICK: if (pickReturn == S_MAIN) leaveSettings(); else goScr(S_WIDGETS); break;
     case S_CAL: if (cfg.cal.valid) goScr(calFromBoot ? S_MAIN : S_SET); break;
+    case S_LED_COLOR: saveLedSettings(); goScr(S_LED); break;
     case S_SHFW_EDIT: goScr(S_SHFW_LIST); break;
     case S_SHFW_BAK: goScr(S_SHFW); break;
     case S_SHFW_PROF: goScr(S_SHFW); break;
@@ -2970,21 +3142,52 @@ void touchSettings() {
     dragId = -1;
     if (scr == S_APPEAR && hit(tch.sx, tch.sy, 0, 196, 240, 50)) dragId = 1;
     else if (scr == S_DISPLAY && hit(tch.sx, tch.sy, 0, 44, 240, 50)) dragId = 2;
+    else if (scr == S_LED && hit(tch.sx, tch.sy, 8, LED_BRIGHT_Y, 224, 30)) dragId = 3;
+    else if (scr == S_LED_COLOR && hit(tch.sx, tch.sy, SV_X, SV_Y, SV_W, SV_H)) dragId = 4;
+    else if (scr == S_LED_COLOR && hit(tch.sx, tch.sy, HUE_X, HUE_Y, HUE_W, HUE_H)) dragId = 5;
   }
   if (dragId >= 0) {
     float f = constrain((tch.x - 10) / 220.0f, 0.0f, 1.0f);
     if (dragId == 1) {
       int h = (int)(f * 359);
       if (h != cfg.hue || cfg.accent != 8) { cfg.hue = h; cfg.accent = 8; drawHueSlider(); }
-    } else {
+    } else if (dragId == 2) {
       int bv = 10 + (int)(f * 90);
       if (bv != cfg.bright) { cfg.bright = bv; setBacklight(bv); drawBrightness(); }
+    } else if (dragId == 3) {
+      int bv = 1 + (int)(f * 254);
+      if (bv != ledCfg.bright) {
+        ledCfg.bright = bv;
+        ledStrip.setBrightness(bv);
+        drawLedBrightness();
+      }
+    } else if (dragId == 4) {
+      int sx = constrain(tch.x - SV_X, 0, SV_W - 1);
+      int sy = constrain(tch.y - SV_Y, 0, SV_H - 1);
+      uint8_t s = (uint8_t)((uint32_t)sx * 255 / (SV_W - 1));
+      uint8_t v = 255 - (uint8_t)((uint32_t)sy * 255 / (SV_H - 1));
+      if (s != ledCfg.sat[ledColorSeg] || v != ledCfg.val[ledColorSeg]) {
+        ledCfg.sat[ledColorSeg] = s;
+        ledCfg.val[ledColorSeg] = v;
+        drawLedSvMarker();
+        drawLedColorPreview();
+      }
+    } else if (dragId == 5) {
+      int h = (int)(constrain((tch.x - HUE_X) / (float)(HUE_W - 1), 0.0f, 1.0f) * 359);
+      if (h != ledCfg.hue[ledColorSeg]) {
+        ledCfg.hue[ledColorSeg] = h;
+        drawLedSvSquare();
+        drawLedSvMarker();
+        drawLedColorPreview();
+        drawLedHueStrip();
+      }
     }
     if (!tch.down) {
       int id = dragId;
       dragId = -1;
-      queueSave();
-      if (id == 1) { applyTheme(); uiMode = -1; }
+      if (id == 1) { queueSave(); applyTheme(); uiMode = -1; }
+      else if (id == 2) queueSave();
+      else if (id == 3) saveLedSettings();
     }
     return;
   }
@@ -3064,7 +3267,7 @@ void touchSettings() {
 
     case S_LED:
       if (!tch.evTap) break;
-      if (hit(x, y, 8, 44, 58, 30) || hit(x, y, 174, 44, 58, 30)) {
+      if (hit(x, y, 8, 40, 58, 26) || hit(x, y, 174, 40, 58, 26)) {
         int count = ledCfg.count + (x < 100 ? -1 : 1);
         ledCfg.count = constrain(count, 1, LED_MAX_COUNT);
         uint16_t allocated = 0;
@@ -3077,12 +3280,12 @@ void touchSettings() {
         applyLedHardware();
         saveLedSettings();
         uiMode = -1;
-      } else if (hit(x, y, 8, 88, 224, 27)) {
+      } else if (hit(x, y, 8, 114, 108, 26)) {
         ledCfg.pinIndex = (ledCfg.pinIndex + 1) % LED_PIN_COUNT;
         applyLedHardware();
         saveLedSettings();
         uiMode = -1;
-      } else if (hit(x, y, 8, 121, 224, 27)) {
+      } else if (hit(x, y, 124, 114, 108, 26)) {
         ledCfg.enabled ^= 1;
         if (!ledCfg.enabled) {
           ledStrip.clear();
@@ -3090,19 +3293,28 @@ void touchSettings() {
         }
         saveLedSettings();
         uiMode = -1;
+      } else if (hit(x, y, 8, 146, 224, 26)) {
+        ledCfg.brake = (ledCfg.brake + 1) % LED_BRAKE_COUNT;
+        saveLedSettings();
+        uiMode = -1;
       } else {
         for (uint8_t i = 0; i < 3; i++) {
-          int rowY = 158 + i * 48;
+          int rowY = 180 + i * 46;
           if (hit(x, y, 14, rowY + 20, 28, 21) && ledCfg.segmentCount[i] > 0) {
             ledCfg.segmentCount[i]--;
           } else if (hit(x, y, 82, rowY + 20, 28, 21)) {
             uint16_t allocated = 0;
             for (uint8_t j = 0; j < 3; j++) allocated += ledCfg.segmentCount[j];
             if (allocated < ledCfg.count) ledCfg.segmentCount[i]++;
-          } else if (hit(x, y, 114, rowY + 20, 76, 21)) {
+          } else if (hit(x, y, 114, rowY + 20, 68, 21)) {
             ledCfg.effect[i] = (ledCfg.effect[i] + 1) % LED_EFFECT_COUNT;
-          } else if (hit(x, y, 196, rowY + 20, 30, 21)) {
-            ledCfg.color[i] = (ledCfg.color[i] + 1) % (sizeof(LED_COLORS) / sizeof(LED_COLORS[0]));
+          } else if (hit(x, y, 196, rowY + 20, 32, 21)) {
+            ledColorSeg = i;
+            ledColorHue0 = ledCfg.hue[i];
+            ledColorSat0 = ledCfg.sat[i];
+            ledColorVal0 = ledCfg.val[i];
+            goScr(S_LED_COLOR);
+            return;
           } else {
             continue;
           }
@@ -3110,6 +3322,32 @@ void touchSettings() {
           uiMode = -1;
           break;
         }
+      }
+      break;
+
+    case S_LED_COLOR:
+      if (!tch.evTap) break;
+      if (hit(x, y, 8, 254, 108, 38)) {                       // ГОТОВО
+        saveLedSettings();
+        goScr(S_LED);
+      } else if (hit(x, y, 124, 254, 108, 38)) {              // ОТМЕНА
+        ledCfg.hue[ledColorSeg] = ledColorHue0;
+        ledCfg.sat[ledColorSeg] = ledColorSat0;
+        ledCfg.val[ledColorSeg] = ledColorVal0;
+        saveLedSettings();
+        goScr(S_LED);
+      } else {
+        for (uint8_t i = 0; i < 8; i++)
+          if (hit(x, y, 10 + i * 28, 168, 26, 26)) {
+            uint32_t rgb = LED_COLORS[i];
+            uint16_t h; uint8_t s, v;
+            rgbToHsv((rgb >> 16) & 0xFF, (rgb >> 8) & 0xFF, rgb & 0xFF, h, s, v);
+            ledCfg.hue[ledColorSeg] = h;
+            ledCfg.sat[ledColorSeg] = s;
+            ledCfg.val[ledColorSeg] = v;
+            uiMode = -1;
+            return;
+          }
       }
       break;
 

@@ -1,0 +1,16 @@
+{
+  "name": "OpenDash (ST7789 / CYD 2USB)",
+  "version": "2.1.1",
+  "new_install_prompt_erase": true,
+  "builds": [
+    {
+      "chipFamily": "ESP32",
+      "parts": [
+        {
+          "path": "firmware/OpenDash-v2.1.1-cyd_2usb-factory.bin",
+          "offset": 0
+        }
+      ]
+    }
+  ]
+}

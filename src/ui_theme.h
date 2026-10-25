@@ -109,7 +109,7 @@ static inline uint16_t uiInkOn(uint16_t fill) {
 
 /*
  * mode: 0 tonal dark, 1 black, 2 slate, 3 light.
- * accent: RGB565 accent; customHue is used when the accent is custom.
+ * accent: RGB565 accent; the caller resolves a custom hue to RGB565 first.
  */
 static inline UiColors uiTheme(uint8_t mode, uint16_t accent) {
   UiColors c;

@@ -1,13 +1,13 @@
 {
   "name": "OpenDash (ILI9341 / CYD)",
-  "version": "2.1.1",
+  "version": "2.1.2",
   "new_install_prompt_erase": true,
   "builds": [
     {
       "chipFamily": "ESP32",
       "parts": [
         {
-          "path": "firmware/OpenDash-v2.1.1-cyd_ili9341-factory.bin",
+          "path": "firmware/OpenDash-v2.1.2-cyd_ili9341-factory.bin",
           "offset": 0
         }
       ]

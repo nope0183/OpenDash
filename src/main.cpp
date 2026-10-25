@@ -21,6 +21,7 @@
 #include <Adafruit_NeoPixel.h>
 #define LEDFX_IMPLEMENTATION
 #include "led_effects.h"
+#include "ui_theme.h"
 #include "ru_fonts.h"   // кириллица для TFT_eSPI (генерируется tools/gen_ru_font.py)
 #include "shfw_table.h" // параметры SHFW (генерируется tools/gen_shfw_table.py из tools/shfw_registers.csv)
 
@@ -46,19 +47,30 @@
 static const uint8_t LED_PINS[] = {4, 16, 17, 22, 26, 27};
 static const uint8_t LED_PIN_COUNT = sizeof(LED_PINS) / sizeof(LED_PINS[0]);
 
-// ---------- Палитра (меняется темой из настроек, см. applyTheme) ----------
+// ---------- Палитра (Material You: тональные токены из акцента) ----------
 constexpr uint16_t C565(uint8_t r, uint8_t g, uint8_t b) {
   return ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
 }
 uint16_t COL_BG     = C565(8, 10, 18);
 uint16_t COL_PANEL  = C565(20, 26, 42);
-uint16_t COL_TRACK  = C565(36, 44, 64);
 uint16_t COL_ACCENT = C565(0, 200, 255);
 uint16_t COL_TXT    = C565(240, 244, 252);
 uint16_t COL_DIM    = C565(125, 138, 165);
 uint16_t COL_GOOD   = C565(60, 225, 120);
 uint16_t COL_WARN   = C565(255, 190, 40);
 uint16_t COL_BAD    = C565(255, 70, 70);
+// Дополнительные Material-токены (surface container levels, outline, контейнеры).
+uint16_t COL_SURFACE_LOW = C565(14, 18, 28);
+uint16_t COL_SURFACE_CONTAINER = C565(20, 26, 42);
+uint16_t COL_SURFACE_HIGH = C565(30, 38, 56);
+uint16_t COL_SURFACE_HIGHEST = C565(40, 50, 70);
+uint16_t COL_ON_PRIMARY = C565(10, 20, 30);
+uint16_t COL_PRIMARY_CONTAINER = C565(24, 70, 90);
+uint16_t COL_OUTLINE = C565(110, 120, 140);
+uint16_t COL_OUTLINE_VAR = C565(55, 64, 82);
+uint16_t COL_ERROR_CONTAINER = C565(80, 30, 34);
+uint16_t COL_ON_ERROR_CONTAINER = C565(255, 210, 210);
+static bool uiForceClear = true;
 
 void status(const String& s, uint16_t col = COL_WARN);
 
@@ -168,6 +180,8 @@ static uint16_t ledColorHue0 = 0;               // цвет до правки (�
 static uint8_t ledColorSat0 = 0, ledColorVal0 = 0;
 static uint8_t ledEffectSeg = 0;                // сегмент, для которого выбирают эффект
 static uint32_t ledSvDrawAt = 0;                // последняя перерисовка HSV-квадрата
+static int ledSvMarkerX = -1, ledSvMarkerY = -1; // где нарисован маркер SV
+static int ledHueMarkerX = -1;                   // где нарисован маркер шкалы оттенка
 // Состояние рендерера: плавные переходы цвета, фазы эффектов, затухание тормоза.
 static LedfxState ledState;
 static uint32_t ledSig = 0;
@@ -1036,13 +1050,8 @@ static Settings cfg;
 static bool otaEnabled = false;
 static bool otaSettingsError = false;
 
-struct Theme { const char* name; const char* nameRu; uint16_t bg, panel, track, txt, dim, good, warn, bad; };
-static const Theme THEMES[4] = {
-  {"NAVY", "Синяя", C565(8, 10, 18), C565(20, 26, 42), C565(36, 44, 64),  C565(240, 244, 252), C565(125, 138, 165), C565(60, 225, 120), C565(255, 190, 40), C565(255, 70, 70)},
-  {"BLACK", "Чёрная", C565(0, 0, 0),   C565(18, 18, 22), C565(44, 44, 52),  C565(245, 245, 250), C565(130, 135, 150), C565(60, 225, 120), C565(255, 190, 40), C565(255, 70, 70)},
-  {"SLATE", "Серая", C565(30, 34, 40), C565(46, 52, 60), C565(74, 82, 94), C565(236, 240, 246), C565(150, 160, 176), C565(60, 225, 120), C565(255, 190, 40), C565(255, 80, 80)},
-  {"LIGHT", "Светлая", C565(232, 236, 244), C565(255, 255, 255), C565(205, 212, 226), C565(16, 20, 32), C565(92, 104, 126), C565(0, 150, 70), C565(225, 140, 0), C565(215, 40, 40)},
-};
+static const char* const THEME_NAME[4] = {"TONAL", "BLACK", "SLATE", "LIGHT"};
+static const char* const THEME_NAME_RU[4] = {"Тональная", "Чёрная", "Серая", "Светлая"};
 static const uint16_t ACCENTS[8] = {
   C565(0, 200, 255), C565(70, 120, 255), C565(170, 90, 255), C565(255, 80, 170),
   C565(255, 70, 70), C565(255, 140, 30), C565(255, 210, 40), C565(60, 225, 120)
@@ -1063,8 +1072,8 @@ static const GFXfont* ruFont(int font) { return font == 4 ? &RU4 : font == 2 ? &
 
 // Рисует строку: текст с кириллицей - растровым шрифтом RU1/RU2/RU4 (по размеру встроенного шрифта 1/2/4),
 // всё остальное (цифры, латиница) - как раньше встроенными шрифтами TFT_eSPI.
-int drawS(const String& s, int x, int y, int font) {
-  if ((font == 1 || font == 2 || font == 4) && nonAscii(s.c_str())) {
+int drawS(const char* s, int x, int y, int font) {
+  if ((font == 1 || font == 2 || font == 4) && nonAscii(s)) {
     tft.setFreeFont(ruFont(font));
     int r = tft.drawString(s, x, y, 1);
     tft.setFreeFont(nullptr);
@@ -1072,14 +1081,20 @@ int drawS(const String& s, int x, int y, int font) {
   }
   return tft.drawString(s, x, y, font);
 }
-int textW(const String& s, int font) {
-  if ((font == 1 || font == 2 || font == 4) && nonAscii(s.c_str())) {
+int drawS(const String& s, int x, int y, int font) {
+  return drawS(s.c_str(), x, y, font);
+}
+int textW(const char* s, int font) {
+  if ((font == 1 || font == 2 || font == 4) && nonAscii(s)) {
     tft.setFreeFont(ruFont(font));
     int w = tft.textWidth(s, 1);
     tft.setFreeFont(nullptr);
     return w;
   }
   return tft.textWidth(s, font);
+}
+int textW(const String& s, int font) {
+  return textW(s.c_str(), font);
 }
 
 // Статусные строки задаются в коде по-английски; перевод подставляется при отрисовке.
@@ -1111,10 +1126,27 @@ uint16_t hue565(int h) {
 }
 
 void applyTheme() {
-  const Theme& t = THEMES[cfg.theme < 4 ? cfg.theme : 0];
-  COL_BG = t.bg; COL_PANEL = t.panel; COL_TRACK = t.track; COL_TXT = t.txt; COL_DIM = t.dim;
-  COL_GOOD = t.good; COL_WARN = t.warn; COL_BAD = t.bad;
-  COL_ACCENT = cfg.accent < 8 ? ACCENTS[cfg.accent] : hue565(cfg.hue);
+  uint16_t accent = cfg.accent < 8 ? ACCENTS[cfg.accent] : hue565(cfg.hue);
+  UiColors t = uiTheme(cfg.theme < 4 ? cfg.theme : 0, accent);
+  COL_BG = t.surface;
+  COL_PANEL = t.surfaceContainer;
+  COL_TXT = t.onSurface;
+  COL_DIM = t.onSurfaceVariant;
+  COL_GOOD = t.success;
+  COL_WARN = t.warning;
+  COL_BAD = t.error;
+  COL_ACCENT = t.primary;
+  COL_SURFACE_LOW = t.surfaceLow;
+  COL_SURFACE_CONTAINER = t.surfaceContainer;
+  COL_SURFACE_HIGH = t.surfaceHigh;
+  COL_SURFACE_HIGHEST = t.surfaceHighest;
+  COL_ON_PRIMARY = t.onPrimary;
+  COL_PRIMARY_CONTAINER = t.primaryContainer;
+  COL_OUTLINE = t.outline;
+  COL_OUTLINE_VAR = t.outlineVariant;
+  COL_ERROR_CONTAINER = t.errorContainer;
+  COL_ON_ERROR_CONTAINER = t.onErrorContainer;
+  uiForceClear = true;
 }
 
 void setDefaults(bool keepCal) {
@@ -1587,18 +1619,25 @@ void status(const String& s, uint16_t col) {
 String fitText(const String& s, int maxW, int font) {
   if (textW(s, font) <= maxW) return s;
   String t = s;
-  while (t.length() > 1 && textW(t + "..", font) > maxW) t.remove(t.length() - 1);
+  while (t.length() > 1 && textW(t + "..", font) > maxW) {
+    // Remove a whole UTF-8 code point: cutting a Cyrillic letter in half
+    // leaves invalid bytes that render as garbage in the RU fonts.
+    int n = (int)t.length() - 1;
+    while (n > 0 && (((uint8_t)t[n]) & 0xC0) == 0x80) n--;
+    t.remove(n);
+  }
   return t + "..";
 }
 
 void drawStatus() {
   if (scr != S_MAIN) return;       // в настройках шапку не трогаем
   stDirty = false;
-  tft.fillCircle(10, 11, 3, stCol);
+  tft.fillRoundRect(3, 2, 141, 19, 9, COL_SURFACE_HIGH);
+  tft.fillCircle(12, 11, 4, stCol);
   tft.setTextDatum(TL_DATUM);
-  tft.setTextColor(stCol, COL_PANEL);
-  tft.setTextPadding(140);
-  drawS(fitText(statusText(stText), 138, 2), 18, 3, 2);
+  tft.setTextColor(stCol, COL_SURFACE_HIGH);
+  tft.setTextPadding(118);
+  drawS(fitText(statusText(stText), 116, 2), 21, 3, 2);
 }
 
 void statusNow(const String& s, uint16_t col = COL_WARN) {
@@ -1607,29 +1646,37 @@ void statusNow(const String& s, uint16_t col = COL_WARN) {
 }
 
 // Кэш текстовых полей: перерисовываем только то, что изменилось (нет мерцания).
+// Фиксированные буферы вместо String: в горячем пути дашборда больше нет
+// аллокаций и фрагментации кучи.
 #define SLOTS 48
-static String cacheS[SLOTS];
+#define FIELD_LEN 56
+static char cacheS[SLOTS][FIELD_LEN];
 static uint16_t cacheC[SLOTS];
 static int chipKey = -1;
 static int litShown = 0;
 static uint32_t barKeys[4];
 
 void clearCache() {
-  for (int i = 0; i < SLOTS; i++) { cacheS[i] = "\x01"; cacheC[i] = 0; }
+  for (int i = 0; i < SLOTS; i++) { cacheS[i][0] = 0; cacheC[i] = 0; }
   chipKey = -1;
   litShown = 0;
   for (int i = 0; i < 4; i++) barKeys[i] = 0xFFFFFFFF;
 }
 
-void field(uint8_t slot, int x, int y, const String& s, int w, int font,
+void field(uint8_t slot, int x, int y, const char* s, int w, int font,
            uint16_t fg, uint8_t datum, uint16_t bg) {
-  if (cacheC[slot] == fg && cacheS[slot] == s) return;
-  cacheS[slot] = s;
+  if (cacheC[slot] == fg && !strcmp(cacheS[slot], s)) return;
+  strncpy(cacheS[slot], s, FIELD_LEN - 1);
+  cacheS[slot][FIELD_LEN - 1] = 0;
   cacheC[slot] = fg;
   tft.setTextDatum(datum);
   tft.setTextColor(fg, bg);
   tft.setTextPadding(w);
   drawS(s, x, y, font);
+}
+void field(uint8_t slot, int x, int y, const String& s, int w, int font,
+           uint16_t fg, uint8_t datum, uint16_t bg) {
+  field(slot, x, y, s.c_str(), w, font, fg, datum, bg);
 }
 
 uint16_t lerp565(uint16_t a, uint16_t b, uint8_t t) {
@@ -1641,7 +1688,7 @@ uint16_t lerp565(uint16_t a, uint16_t b, uint8_t t) {
   return (r << 11) | (g << 5) | bl;
 }
 
-void card(int x, int y, int w, int h) { tft.fillRoundRect(x, y, w, h, 6, COL_PANEL); }
+void card(int x, int y, int w, int h) { tft.fillRoundRect(x, y, w, h, 16, COL_PANEL); }
 
 void label(int x, int y, const char* s, uint8_t datum = TL_DATUM) {
   tft.setTextDatum(datum);
@@ -1654,28 +1701,31 @@ uint16_t tempColor(float t) { return t < 45 ? COL_GOOD : t < 60 ? COL_WARN : COL
 
 // ---------- Шапка ----------
 void drawGear(int cx, int cy, uint16_t col, uint16_t bg) {
-  tft.fillRect(cx - 2, cy - 9, 4, 4, col);
-  tft.fillRect(cx - 2, cy + 5, 4, 4, col);
-  tft.fillRect(cx - 9, cy - 2, 4, 4, col);
-  tft.fillRect(cx + 5, cy - 2, 4, 4, col);
-  tft.fillCircle(cx, cy, 6, col);
-  tft.fillCircle(cx, cy, 2, bg);
+  (void)col;
+  tft.fillCircle(cx, cy, 11, COL_SURFACE_HIGH);
+  for (int k = -1; k <= 1; k++)
+    tft.drawFastHLine(cx - 6, cy + k * 4, 12, COL_DIM);
+  tft.fillCircle(cx - 2, cy - 4, 2, COL_ACCENT);
+  tft.fillCircle(cx + 3, cy, 2, COL_ACCENT);
+  tft.fillCircle(cx - 1, cy + 4, 2, COL_ACCENT);
+  (void)bg;
 }
 
 void drawHeaderStatic(bool dots) {
-  tft.fillRect(0, 0, 240, 23, COL_PANEL);
-  tft.drawFastHLine(0, 23, 240, COL_TRACK);
+  tft.fillRect(0, 0, 240, 24, COL_BG);
+  tft.drawFastHLine(0, 23, 240, COL_OUTLINE_VAR);
   if (dots) {
     int n = 0;
     for (int p = 0; p < 3; p++) if (pageOn(p)) n++;
-    int x = 196 - (n - 1) * 12;
+    int x = 194 - (n - 1) * 12;
     for (int p = 0; p < 3; p++) {
       if (!pageOn(p)) continue;
-      tft.fillCircle(x, 11, p == page ? 3 : 2, p == page ? COL_ACCENT : COL_TRACK);
+      if (p == page) tft.fillRoundRect(x - 4, 9, 8, 4, 2, COL_ACCENT);
+      else tft.fillCircle(x, 11, 2, COL_OUTLINE);
       x += 12;
     }
   }
-  drawGear(224, 11, COL_DIM, COL_PANEL);
+  drawGear(224, 11, COL_TXT, COL_BG);
 }
 
 // ---------- Спидометр ----------
@@ -1709,7 +1759,7 @@ void updateGauge(float speed) {
   int lit = constrain((int)lroundf(speed / gmax() * GAUGE_SEGS), 0, GAUGE_SEGS);
   if (lit == litShown) return;
   if (lit > litShown) { for (int i = litShown; i < lit; i++) gaugeSeg(i, gaugeColor(i)); }
-  else                { for (int i = lit; i < litShown; i++) gaugeSeg(i, COL_TRACK); }
+  else                { for (int i = lit; i < litShown; i++) gaugeSeg(i, COL_SURFACE_HIGH); }
   litShown = lit;
 }
 
@@ -1718,20 +1768,22 @@ static const int CX[4] = {8, 124, 8, 124};
 static const int CY[4] = {207, 207, 263, 263};
 
 void dashStatic() {
-  for (int i = 0; i < GAUGE_SEGS; i++) gaugeSeg(i, COL_TRACK);
+  tft.fillCircle(GCX, GCY, 88, COL_SURFACE_LOW);
+  for (int i = 0; i < GAUGE_SEGS; i++) gaugeSeg(i, COL_SURFACE_HIGH);
   litShown = 0;
 
   tft.setTextPadding(0);
   tft.setTextDatum(MC_DATUM);
-  tft.setTextColor(COL_DIM, COL_BG);
+  tft.setTextColor(COL_DIM, COL_SURFACE_LOW);
   for (int k = 0; k <= 3; k++) {
     float a = (-120.0f + 80.0f * k) * 0.0174533f;
     char b[6];
     snprintf(b, sizeof(b), "%d", gmax() * k / 3);
     drawS(b, lroundf(GCX + 57 * sinf(a)), lroundf(GCY - 57 * cosf(a)), 1);
   }
-  tft.setTextColor(COL_ACCENT, COL_BG);
-  drawS(uSpd(), GCX, GCY + 20, 2);
+  tft.setTextColor(COL_ACCENT, COL_SURFACE_LOW);
+  drawS(uSpd(), GCX, GCY + 18, 2);
+  tft.fillRoundRect(55, GCY + 36, 130, 20, 10, COL_SURFACE_CONTAINER);
   for (int i = 0; i < 4; i++) {
     card(CX[i], CY[i], 108, 50);
     label(CX[i] + 8, CY[i] + 4, metricName(cfg.card[i]));
@@ -1740,18 +1792,20 @@ void dashStatic() {
 
 void drawBar(int x, int y, int lit, uint16_t col) {
   for (int i = 0; i < 10; i++)
-    tft.fillRoundRect(x + (i * 92) / 10, y, 7, 6, 2, i < lit ? col : COL_TRACK);
+    tft.fillRoundRect(x + (i * 92) / 10, y, 7, 6, 3, i < lit ? col : COL_SURFACE_HIGH);
 }
 
-struct CardOut { String v, sub; uint16_t col; int bar; };
+struct CardOut { char v[16]; char sub[28]; uint16_t col; int bar; };
 
-String rideModeLabel() {
+const char* rideModeLabel(char* buf, size_t n) {
   if (!(d.valid & (1U << RIDE_MODE))) return "--";
   switch (d.rideMode) {
     case 0: return TR("DRIVE", "ДРАЙВ");
     case 1: return TR("ECO", "ЭКО");
     case 2: return TR("SPORT", "СПОРТ");
-    default: return String(TR("MODE ", "РЕЖИМ ")) + String(d.rideMode);
+    default:
+      snprintf(buf, n, "%s%d", TR("MODE ", "РЕЖИМ "), d.rideMode);
+      return buf;
   }
 }
 
@@ -1767,13 +1821,17 @@ uint16_t rideModeColor() {
 
 CardOut metricOut(uint8_t m) {
   CardOut o;
-  o.v = "--"; o.sub = " "; o.col = COL_DIM; o.bar = -1;
+  strcpy(o.v, "--");
+  o.sub[0] = ' ';
+  o.sub[1] = 0;
+  o.col = COL_DIM;
+  o.bar = -1;
   const bool hasTotal = (d.valid & ((1U << TOTAL_LO) | (1U << TOTAL_HI))) == ((1U << TOTAL_LO) | (1U << TOTAL_HI));
   switch (m) {
     case M_BATT:
       o.bar = 0;
       if (d.valid & (1U << SOC)) {
-        o.v = String(d.soc) + "%";
+        snprintf(o.v, sizeof(o.v), "%d%%", d.soc);
         o.col = d.soc > 50 ? COL_GOOD : d.soc > 20 ? COL_WARN : COL_BAD;
         o.bar = (d.soc + 5) / 10;
       }
@@ -1781,39 +1839,60 @@ CardOut metricOut(uint8_t m) {
     case M_POWER:
       if ((d.valid & (1U << VOLT)) && (d.valid & (1U << AMP))) {
         float w = d.volt * d.amp;
-        o.v = String((int)w) + " W";
+        snprintf(o.v, sizeof(o.v), "%d W", (int)w);
         o.col = w < -5 ? COL_GOOD : w > 600 ? COL_WARN : COL_TXT;
-        o.sub = String(d.volt, 1) + "V " + String(d.amp, 1) + "A";
-      } else o.v = "-- W";
+        snprintf(o.sub, sizeof(o.sub), "%.1fV %.1fA", d.volt, d.amp);
+      } else {
+        strcpy(o.v, "-- W");
+      }
       break;
     case M_TRIP:
-      if (d.valid & (1U << TRIP)) { o.v = String(kmU(d.tripKm), 2); o.col = COL_TXT; }
-      o.sub = uDst();
+      if (d.valid & (1U << TRIP)) {
+        snprintf(o.v, sizeof(o.v), "%.2f", kmU(d.tripKm));
+        o.col = COL_TXT;
+      }
+      strncpy(o.sub, uDst(), sizeof(o.sub) - 1);
+      o.sub[sizeof(o.sub) - 1] = 0;
       break;
     case M_TEMP: {
       bool he = d.valid & (1U << ETEMP), hb = d.valid & (1U << BTEMP);
-      o.v = (he ? String((int)lroundf(d.escTemp)) : String("--")) + "/" + (hb ? String((int)lroundf(d.battTemp)) : String("--"));
+      char a[8], b[8];
+      if (he) snprintf(a, sizeof(a), "%d", (int)lroundf(d.escTemp)); else strcpy(a, "--");
+      if (hb) snprintf(b, sizeof(b), "%d", (int)lroundf(d.battTemp)); else strcpy(b, "--");
+      snprintf(o.v, sizeof(o.v), "%s/%s", a, b);
       o.col = he ? tempColor(d.escTemp) : hb ? tempColor(d.battTemp) : COL_DIM;
-      o.sub = TR("ESC/BAT C", "ESC/АКБ C");
+      strncpy(o.sub, TR("ESC/BAT C", "ESC/АКБ C"), sizeof(o.sub) - 1);
+      o.sub[sizeof(o.sub) - 1] = 0;
       break;
     }
     case M_ODO:
       if (hasTotal) {
         float t = kmU(d.totalKm);
-        o.v = t >= 1000 ? String((int)lroundf(t)) : String(t, 1);
+        if (t >= 1000) snprintf(o.v, sizeof(o.v), "%d", (int)lroundf(t));
+        else snprintf(o.v, sizeof(o.v), "%.1f", t);
         o.col = COL_TXT;
       }
-      o.sub = uDst();
+      strncpy(o.sub, uDst(), sizeof(o.sub) - 1);
+      o.sub[sizeof(o.sub) - 1] = 0;
       break;
     case M_VOLT:
-      if (d.valid & (1U << VOLT)) { o.v = String(d.volt, 1) + " V"; o.col = COL_TXT; }
+      if (d.valid & (1U << VOLT)) {
+        snprintf(o.v, sizeof(o.v), "%.1f V", d.volt);
+        o.col = COL_TXT;
+      }
       break;
     case M_CURR:
-      if (d.valid & (1U << AMP)) { o.v = String(d.amp, 1) + " A"; o.col = d.amp < -0.5f ? COL_GOOD : COL_TXT; }
+      if (d.valid & (1U << AMP)) {
+        snprintf(o.v, sizeof(o.v), "%.1f A", d.amp);
+        o.col = d.amp < -0.5f ? COL_GOOD : COL_TXT;
+      }
       break;
     case M_MAXSPD:
-      if (d.valid & (1U << SPEED)) { o.v = String(kmU(sessionMax), 1); o.col = COL_TXT; }
-      o.sub = String(uSpd()) + " " + TR("this ride", "за поездку");
+      if (d.valid & (1U << SPEED)) {
+        snprintf(o.v, sizeof(o.v), "%.1f", kmU(sessionMax));
+        o.col = COL_TXT;
+      }
+      snprintf(o.sub, sizeof(o.sub), "%s %s", uSpd(), TR("this ride", "за поездку"));
       break;
   }
   return o;
@@ -1824,17 +1903,29 @@ void dashDynamic() {
   const bool hasTotal = (d.valid & ((1U << TOTAL_LO) | (1U << TOTAL_HI))) == ((1U << TOTAL_LO) | (1U << TOTAL_HI));
 
   updateGauge(hasSpeed ? kmU(d.speed) : 0);
-  field(0, GCX, GCY - 8, hasSpeed ? String(kmU(d.speed), 1) : String("--"), 120, 7, COL_TXT, MC_DATUM, COL_BG);
-  field(10, GCX, GCY + 40, rideModeLabel(), 100, 2, rideModeColor(), MC_DATUM, COL_BG);
-  field(1, GCX, 188, hasTotal ? TR("ODO ", "ОДО ") + String(kmU(d.totalKm), 1) + " " + uDst() : String(TR("ODO -- ", "ОДО -- ")) + uDst(), 150, 2, COL_DIM, MC_DATUM, COL_BG);
+  char speed[16];
+  if (hasSpeed) snprintf(speed, sizeof(speed), "%.1f", kmU(d.speed)); else strcpy(speed, "--");
+  field(0, GCX, GCY - 8, speed, 120, 7, COL_TXT, MC_DATUM, COL_SURFACE_LOW);
+  char mode[20];
+  field(10, GCX, GCY + 46, rideModeLabel(mode, sizeof(mode)), 110, 2, rideModeColor(), MC_DATUM, COL_SURFACE_CONTAINER);
+  char odo[48];
+  if (hasTotal) snprintf(odo, sizeof(odo), "%s%.1f %s", TR("ODO ", "ОДО "), kmU(d.totalKm), uDst());
+  else snprintf(odo, sizeof(odo), "%s%s", TR("ODO -- ", "ОДО -- "), uDst());
+  field(1, GCX, 188, odo, 150, 2, COL_DIM, MC_DATUM, COL_SURFACE_LOW);
 
   for (int i = 0; i < 4; i++) {
     CardOut c = metricOut(cfg.card[i] % M_COUNT);
     field(2 + 2 * i, CX[i] + 8, CY[i] + 18, c.v, 92, 4, c.col, TL_DATUM, COL_PANEL);
     if (c.bar >= 0) {
+      if (barKeys[i] == 0xFFFFFFFF)
+        tft.fillRect(CX[i] + 8, CY[i] + 34, 92, 16, COL_PANEL);   // erase old text row
       uint32_t key = ((uint32_t)c.bar << 16) | c.col;
       if (key != barKeys[i]) { barKeys[i] = key; drawBar(CX[i] + 8, CY[i] + 36, c.bar, c.col); }
     } else {
+      if (barKeys[i] != 0xFFFFFFFF) {
+        tft.fillRect(CX[i] + 8, CY[i] + 34, 92, 16, COL_PANEL);   // erase old bar
+        barKeys[i] = 0xFFFFFFFF;
+      }
       field(3 + 2 * i, CX[i] + 8, CY[i] + 39, c.sub, 92, 1, COL_DIM, TL_DATUM, COL_PANEL);
     }
   }
@@ -1859,19 +1950,23 @@ void infoStatic() {
 
 void infoDynamic() {
   const bool hasTotal = (d.valid & ((1U << TOTAL_LO) | (1U << TOTAL_HI))) == ((1U << TOTAL_LO) | (1U << TOTAL_HI));
-  char b[16];
-  snprintf(b, sizeof(b), "%X.%02X", d.fw >> 8, d.fw & 0xFF);
-  String v[8] = {
-    devName,
-    d.serial[0] ? String(d.serial) : String("--"),
-    d.fw ? String(b) : String("--"),
-    hasTotal ? String(kmU(d.totalKm), 1) : String("--"),
-    d.valid & (1U << TRIP) ? String(kmU(d.tripKm), 2) : String("--"),
-    d.valid & (1U << VOLT) ? String(d.volt, 2) : String("--"),
-    d.valid & (1U << AMP) ? String(d.amp, 2) : String("--"),
-    String(d.valid & (1U << ETEMP) ? String((int)lroundf(d.escTemp)) : String("--")) + " / " +
-      (d.valid & (1U << BTEMP) ? String((int)lroundf(d.battTemp)) : String("--")),
-  };
+  char fw[16];
+  snprintf(fw, sizeof(fw), "%X.%02X", d.fw >> 8, d.fw & 0xFF);
+  char v[8][24];
+  strncpy(v[0], devName.length() ? devName.c_str() : "--", sizeof(v[0]) - 1);
+  v[0][sizeof(v[0]) - 1] = 0;
+  strncpy(v[1], d.serial[0] ? d.serial : "--", sizeof(v[1]) - 1);
+  v[1][sizeof(v[1]) - 1] = 0;
+  strncpy(v[2], d.fw ? fw : "--", sizeof(v[2]) - 1);
+  v[2][sizeof(v[2]) - 1] = 0;
+  if (hasTotal) snprintf(v[3], sizeof(v[3]), "%.1f", kmU(d.totalKm)); else strcpy(v[3], "--");
+  if (d.valid & (1U << TRIP)) snprintf(v[4], sizeof(v[4]), "%.2f", kmU(d.tripKm)); else strcpy(v[4], "--");
+  if (d.valid & (1U << VOLT)) snprintf(v[5], sizeof(v[5]), "%.2f", d.volt); else strcpy(v[5], "--");
+  if (d.valid & (1U << AMP)) snprintf(v[6], sizeof(v[6]), "%.2f", d.amp); else strcpy(v[6], "--");
+  char te[8], tb[8];
+  if (d.valid & (1U << ETEMP)) snprintf(te, sizeof(te), "%d", (int)lroundf(d.escTemp)); else strcpy(te, "--");
+  if (d.valid & (1U << BTEMP)) snprintf(tb, sizeof(tb), "%d", (int)lroundf(d.battTemp)); else strcpy(tb, "--");
+  snprintf(v[7], sizeof(v[7]), "%s / %s", te, tb);
   for (int i = 0; i < 8; i++) {
     int x, y;
     tileXY(i, x, y);
@@ -1880,10 +1975,15 @@ void infoDynamic() {
 }
 
 // ---------- Страница 2: отладка ----------
-String hexLine(const uint8_t* p, int n) {
-  String s;
-  for (int i = 0; i < n; i++) { char b[4]; snprintf(b, sizeof(b), "%02X ", p[i]); s += b; }
-  return s;
+void hexLine(char* out, size_t cap, const uint8_t* p, int n) {
+  size_t pos = 0;
+  if (!cap) return;
+  out[0] = 0;
+  for (int i = 0; i < n; i++) {
+    int w = snprintf(out + pos, cap - pos, "%02X ", p[i]);
+    if (w < 0 || (size_t)w >= cap - pos) break;
+    pos += (size_t)w;
+  }
 }
 
 void debugStatic() {
@@ -1902,16 +2002,21 @@ void debugStatic() {
 
 void debugDynamic() {
   uint32_t v[4] = {notifyCount, txCount, frameCount, checksumErrors};
+  char b[12];
   for (int i = 0; i < 4; i++) {
     int x = 16 + (i % 2) * 116;
     int y = 44 + (i / 2) * 42;
-    field(20 + i, x, y, String(v[i]), 90, 2, i == 3 && v[i] ? COL_BAD : COL_TXT, TL_DATUM, COL_PANEL);
+    snprintf(b, sizeof(b), "%u", (unsigned)v[i]);
+    field(20 + i, x, y, b, 90, 2, i == 3 && v[i] ? COL_BAD : COL_TXT, TL_DATUM, COL_PANEL);
   }
   int n = lastNotifyLen;
   int n1 = min(n, 14), n2 = n > 14 ? n - 14 : 0;
-  field(24, 16, 136, hexLine(lastNotify, n1), 208, 1, COL_ACCENT, TL_DATUM, COL_PANEL);
-  field(25, 16, 150, hexLine(lastNotify + 14, n2), 208, 1, COL_ACCENT, TL_DATUM, COL_PANEL);
-  for (int i = 0; i < 7; i++) field(26 + i, 16, 194 + i * 16, dbg[i], 208, 1, COL_GOOD, TL_DATUM, COL_PANEL);
+  char hex[48];
+  hexLine(hex, sizeof(hex), lastNotify, n1);
+  field(24, 16, 136, hex, 208, 1, COL_ACCENT, TL_DATUM, COL_PANEL);
+  hexLine(hex, sizeof(hex), lastNotify + 14, n2);
+  field(25, 16, 150, hex, 208, 1, COL_ACCENT, TL_DATUM, COL_PANEL);
+  for (int i = 0; i < 7; i++) field(26 + i, 16, 194 + i * 16, dbg[i].c_str(), 208, 1, COL_GOOD, TL_DATUM, COL_PANEL);
 }
 
 // ---------- Экран подключения ----------
@@ -1947,7 +2052,8 @@ void connectDynamic() {
     int dd = (head - i + 12) % 12;
     uint8_t alpha = dd < 7 ? 255 - dd * 36 : 20;
     float a = i * 30 * 0.0174533f;
-    tft.fillCircle(120 + lroundf(34 * sinf(a)), 100 - lroundf(34 * cosf(a)), 5, lerp565(COL_BG, base, alpha));
+    tft.fillCircle(120 + lroundf(34 * sinf(a)), 100 - lroundf(34 * cosf(a)), 5,
+                   lerp565(COL_SURFACE_HIGH, base, alpha));
   }
 
   const char* titles[4] = {TR("SEARCHING", "Поиск"), TR("CONNECTING", "Подключение"), TR("PRESS POWER", "Нажмите кнопку"), TR("PAIRING", "Сопряжение")};
@@ -1965,10 +2071,11 @@ void connectDynamic() {
     for (int i = 0; i < 4; i++) {
       int x = 8 + i * 57;
       uint16_t fill, fg;
-      if (i < phase)       { fill = lerp565(COL_PANEL, COL_ACCENT, 90); fg = COL_TXT; }
-      else if (i == phase) { fill = blink ? COL_TXT : base; fg = COL_BG; }
-      else                 { fill = COL_PANEL; fg = COL_DIM; }
-      tft.fillRoundRect(x, 224, 52, 26, 6, fill);
+      if (i < phase)       { fill = lerp565(COL_SURFACE_HIGH, COL_ACCENT, 110); fg = uiInkOn(fill); }
+      else if (i == phase) { fill = blink ? COL_TXT : base; fg = uiInkOn(fill); }
+      else                 { fill = COL_SURFACE_CONTAINER; fg = COL_DIM; }
+      tft.fillRoundRect(x, 224, 52, 26, 13, fill);
+      if (i > phase) tft.drawRoundRect(x, 224, 52, 26, 13, COL_OUTLINE_VAR);
       tft.setTextDatum(MC_DATUM);
       tft.setTextColor(fg, fill);
       tft.setTextPadding(0);
@@ -1980,27 +2087,42 @@ void connectDynamic() {
 // =====================================================================
 //                         ЭКРАНЫ НАСТРОЕК
 // =====================================================================
+static int btnRadius(int h) {
+  int r = h / 2;
+  return r > 16 ? 16 : r;
+}
+
 void btn(int x, int y, int w, int h, const char* txt, bool sel, int font = 2) {
-  uint16_t fill = sel ? COL_ACCENT : COL_PANEL;
-  uint16_t fg = sel ? COL_BG : COL_TXT;
-  tft.fillRoundRect(x, y, w, h, 6, fill);
+  int r = btnRadius(h);
+  uint16_t fill = sel ? COL_ACCENT : COL_SURFACE_HIGH;
+  uint16_t fg = sel ? COL_ON_PRIMARY : COL_TXT;
+  tft.fillRoundRect(x, y, w, h, r, fill);
+  if (!sel) tft.drawRoundRect(x, y, w, h, r, COL_OUTLINE_VAR);
   tft.setTextDatum(MC_DATUM);
   tft.setTextColor(fg, fill);
   tft.setTextPadding(0);
   drawS(txt, x + w / 2, y + h / 2, font);
 }
 
-void btnText(int x, int y, int w, int h, const String& txt, bool sel, int font = 2) {
-  uint16_t fill = sel ? COL_ACCENT : COL_PANEL;
-  uint16_t fg = sel ? COL_BG : COL_TXT;
-  tft.fillRoundRect(x, y, w, h, 6, fill);
+void btnText(int x, int y, int w, int h, const char* txt, bool sel, int font = 2) {
+  int r = btnRadius(h);
+  uint16_t fill = sel ? COL_ACCENT : COL_SURFACE_HIGH;
+  uint16_t fg = sel ? COL_ON_PRIMARY : COL_TXT;
+  tft.fillRoundRect(x, y, w, h, r, fill);
+  if (!sel) tft.drawRoundRect(x, y, w, h, r, COL_OUTLINE_VAR);
   tft.setTextDatum(MC_DATUM);
   tft.setTextColor(fg, fill);
   tft.setTextPadding(0);
   drawS(txt, x + w / 2, y + h / 2, font);
+}
+void btnText(int x, int y, int w, int h, const String& txt, bool sel, int font = 2) {
+  btnText(x, y, w, h, txt.c_str(), sel, font);
 }
 
 void secLabel(int x, int y, const char* s) {
+  // Clearing the whole label line makes a settings redraw safe without
+  // fillScreen(): the old (possibly longer) text cannot survive.
+  tft.fillRect(x, y - 1, 240 - x, 11, COL_BG);
   tft.setTextDatum(TL_DATUM);
   tft.setTextColor(COL_DIM, COL_BG);
   tft.setTextPadding(0);
@@ -2008,24 +2130,35 @@ void secLabel(int x, int y, const char* s) {
 }
 
 void settingsHeader(const char* title) {
-  tft.fillRect(0, 0, 240, 28, COL_PANEL);
-  tft.drawFastHLine(0, 28, 240, COL_TRACK);
-  tft.fillTriangle(16, 14, 25, 7, 25, 21, COL_ACCENT);
-  tft.setTextDatum(MC_DATUM);
-  tft.setTextColor(COL_TXT, COL_PANEL);
+  tft.fillRect(0, 0, 240, 28, COL_BG);
+  tft.drawFastHLine(0, 27, 240, COL_OUTLINE_VAR);
+  tft.fillCircle(18, 14, 12, COL_SURFACE_HIGH);
+  tft.drawLine(21, 9, 15, 14, COL_TXT);
+  tft.drawLine(15, 14, 21, 19, COL_TXT);
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextColor(COL_TXT, COL_BG);
   tft.setTextPadding(0);
-  drawS(title, 130, 14, 2);
+  drawS(fitText(title, 194, 2), 38, 5, 2);
 }
 
 void drawSlider(int y, float frac) {
   frac = constrain(frac, 0.0f, 1.0f);
-  tft.fillRoundRect(10, y, 220, 28, 8, COL_PANEL);
-  tft.fillRoundRect(10, y, 12 + (int)(frac * 208), 28, 8, COL_ACCENT);
+  int cy = y + 14;
+  int tx = 10 + (int)(frac * 208.0f);
+  // The thumb is taller than the track, so clear the whole slider band first;
+  // otherwise the previous thumb leaves rings behind while dragging.
+  tft.fillRect(8, y, 224, 28, COL_BG);
+  tft.fillRoundRect(10, cy - 6, 220, 12, 6, COL_SURFACE_HIGHEST);
+  tft.drawRoundRect(10, cy - 6, 220, 12, 6, COL_OUTLINE_VAR);
+  if (tx > 10) tft.fillRoundRect(10, cy - 6, tx - 10 + 6, 12, 6, COL_ACCENT);
+  tft.fillCircle(tx, cy, 10, COL_BG);
+  tft.fillCircle(tx, cy, 8, COL_ACCENT);
 }
 
 void drawBrightness() {
   char b[8];
   snprintf(b, sizeof(b), "%d%%", cfg.bright);
+  tft.fillRect(160, 30, 76, 22, COL_BG);
   tft.setTextDatum(TR_DATUM);
   tft.setTextColor(COL_ACCENT, COL_BG);
   tft.setTextPadding(48);
@@ -2034,16 +2167,17 @@ void drawBrightness() {
 }
 
 void drawHueSlider() {
-  tft.fillRect(8, 200, 224, 6, COL_BG);
-  tft.fillRect(8, 236, 224, 6, COL_BG);
+  tft.fillRoundRect(8, 200, 224, 42, 14, COL_SURFACE_LOW);
   for (int i = 0; i < 220; i++) tft.drawFastVLine(10 + i, 206, 30, hue565(i * 359 / 219));
+  tft.drawRoundRect(9, 205, 222, 32, 6, COL_OUTLINE_VAR);
   int kx = 10 + cfg.hue * 219 / 359;
-  tft.fillRoundRect(kx - 4, 201, 9, 40, 3, COL_TXT);
+  tft.fillRoundRect(kx - 4, 201, 9, 40, 4, COL_BG);
+  tft.drawRoundRect(kx - 4, 201, 9, 40, 4, COL_OUTLINE);
   tft.fillRect(kx - 2, 206, 5, 30, hue565(cfg.hue));
 }
 
 // ---------- Экран ARGB-ленты: яркость и выбор цвета ----------
-#define LED_BRIGHT_Y  80            // верх ползунка яркости ленты
+#define LED_BRIGHT_Y  84            // верх ползунка яркости ленты
 #define SV_X 8
 #define SV_Y 36
 #define SV_W 136
@@ -2074,13 +2208,37 @@ void drawLedSvSquare() {
     for (int x = 0; x < SV_W; x++) row[x] = ledColor565(hue, sat[x], v);
     tft.pushImage(SV_X, SV_Y + y, SV_W, 1, row);
   }
+  ledSvMarkerX = ledSvMarkerY = -1;
+}
+
+// Repaint a small patch of the SV square (used to erase the old marker).
+void drawLedSvPatch(int cx, int cy, uint16_t hue) {
+  if (cx < 0 || cy < 0) return;
+  int x0 = cx - 10, x1 = cx + 10, y0 = cy - 10, y1 = cy + 10;
+  if (x0 < SV_X) x0 = SV_X;
+  if (x1 > SV_X + SV_W - 1) x1 = SV_X + SV_W - 1;
+  if (y0 < SV_Y) y0 = SV_Y;
+  if (y1 > SV_Y + SV_H - 1) y1 = SV_Y + SV_H - 1;
+  uint16_t row[21];
+  for (int y = y0; y <= y1; y++) {
+    uint8_t v = 255 - (uint8_t)((uint32_t)(y - SV_Y) * 255 / (SV_H - 1));
+    for (int x = x0; x <= x1; x++) {
+      uint8_t s = (uint8_t)((uint32_t)(x - SV_X) * 255 / (SV_W - 1));
+      row[x - x0] = ledColor565(hue, s, v);
+    }
+    tft.pushImage(x0, y, x1 - x0 + 1, 1, row);
+  }
 }
 
 void drawLedSvMarker() {
+  uint16_t hue = ledCfg.hue[ledColorSeg];
   int x = SV_X + (int)ledCfg.sat[ledColorSeg] * (SV_W - 1) / 255;
   int y = SV_Y + (SV_H - 1) - (int)ledCfg.val[ledColorSeg] * (SV_H - 1) / 255;
-  tft.drawCircle(x, y, 7, COL_BG);
-  tft.drawCircle(x, y, 6, COL_TXT);
+  if (ledSvMarkerX >= 0) drawLedSvPatch(ledSvMarkerX, ledSvMarkerY, hue);
+  tft.drawCircle(x, y, 8, COL_BG);
+  tft.drawCircle(x, y, 7, COL_TXT);
+  ledSvMarkerX = x;
+  ledSvMarkerY = y;
 }
 
 void drawLedHueGradient() {
@@ -2088,21 +2246,37 @@ void drawLedHueGradient() {
   // when the screen opens; dragging only moves the marker.
   for (int i = 0; i < HUE_W; i++)
     tft.drawFastVLine(HUE_X + i, HUE_Y, HUE_H, hue565(i * 359 / (HUE_W - 1)));
+  tft.drawRoundRect(HUE_X - 1, HUE_Y - 1, HUE_W + 2, HUE_H + 2, 8, COL_OUTLINE_VAR);
+  ledHueMarkerX = -1;
 }
 
 void drawLedHueMarker() {
   int kx = HUE_X + (int)ledCfg.hue[ledColorSeg] * (HUE_W - 1) / 359;
-  tft.fillRoundRect(kx - 4, HUE_Y - 2, 9, HUE_H + 4, 3, COL_TXT);
+  int old = ledHueMarkerX;
+  if (old >= 0 && old != kx) {
+    // Restore just the old 9-pixel marker stripe, not the whole 224-line
+    // wheel: that is what keeps hue dragging smooth.
+    tft.fillRect(old - 4, HUE_Y - 3, 9, HUE_H + 6, COL_BG);
+    for (int x = old - 4; x <= old + 4; x++) {
+      if (x < HUE_X || x >= HUE_X + HUE_W) continue;
+      tft.drawFastVLine(x, HUE_Y, HUE_H, hue565((x - HUE_X) * 359 / (HUE_W - 1)));
+    }
+    tft.drawFastHLine(old - 4, HUE_Y - 1, 9, COL_OUTLINE_VAR);
+    tft.drawFastHLine(old - 4, HUE_Y + HUE_H, 9, COL_OUTLINE_VAR);
+  }
+  tft.fillRoundRect(kx - 4, HUE_Y - 3, 9, HUE_H + 6, 4, COL_BG);
+  tft.drawRoundRect(kx - 4, HUE_Y - 3, 9, HUE_H + 6, 4, COL_TXT);
   tft.fillRect(kx - 2, HUE_Y, 5, HUE_H, hue565(ledCfg.hue[ledColorSeg]));
+  ledHueMarkerX = kx;
 }
 
 void drawLedPresets() {
   for (uint8_t i = 0; i < 8; i++) {
     uint32_t rgb = LED_COLORS[i];
     uint16_t c = tft.color565((rgb >> 16) & 0xFF, (rgb >> 8) & 0xFF, rgb & 0xFF);
-    int x = 10 + i * 28;
-    tft.fillRoundRect(x, 168, 26, 26, 4, c);
-    tft.drawRoundRect(x, 168, 26, 26, 4, COL_TRACK);
+    int cx = 10 + i * 28 + 13;
+    tft.fillCircle(cx, 181, 13, c);
+    tft.drawCircle(cx, 181, 13, COL_OUTLINE_VAR);
   }
 }
 
@@ -2110,21 +2284,23 @@ void drawLedColorPreview() {
   uint16_t h = ledCfg.hue[ledColorSeg];
   uint8_t s = ledCfg.sat[ledColorSeg], v = ledCfg.val[ledColorSeg];
   uint32_t rgb = ledColorRgb(h, s, v);
-  tft.fillRoundRect(152, 36, 80, 80, 6, ledColor565(h, s, v));
-  tft.drawRoundRect(152, 36, 80, 80, 6, COL_TXT);
+  tft.fillRoundRect(152, 36, 80, 80, 20, ledColor565(h, s, v));
+  tft.drawRoundRect(152, 36, 80, 80, 20, COL_OUTLINE_VAR);
+  tft.fillRect(152, 120, 84, 30, COL_BG);
   char b[40];
   snprintf(b, sizeof(b), "#%02X%02X%02X", (rgb >> 16) & 0xFF, (rgb >> 8) & 0xFF, rgb & 0xFF);
   tft.setTextDatum(TL_DATUM);
   tft.setTextColor(COL_TXT, COL_BG);
   tft.setTextPadding(0);
   drawS(b, 152, 122, 1);
-  snprintf(b, sizeof(b), TR("H %d  S %d  V %d", "ОТТ %d  Н %d  Я %d"), h, s, v);
+  snprintf(b, sizeof(b), TR("H%d S%d V%d", "ОТТ%d Н%d Я%d"), h, s, v);
   tft.setTextColor(COL_DIM, COL_BG);
   drawS(b, 152, 136, 1);
 }
 
 void drawGaugePreview() {
-  for (int i = 0; i < GAUGE_SEGS; i++) tft.fillRect(20 + i * 5, 250, 4, 18, gaugeColor(i));
+  for (int i = 0; i < GAUGE_SEGS; i++)
+    tft.fillRoundRect(20 + i * 5, 250, 4, 18, 2, gaugeColor(i));
 }
 
 // ---------- SHFW: состояние экранов и помощники ----------
@@ -2233,37 +2409,41 @@ void drawSettingsScreen() {
                                 TR("RESET TO DEFAULTS", "Сброс настроек")};
       char dm[10];
       if (cfg.dim) snprintf(dm, sizeof(dm), TR("%ds", "%d с"), DIM_SEC[cfg.dim]); else strcpy(dm, TR("off", "выкл"));
-      const char* tn = cfg.lang ? THEMES[cfg.theme].nameRu : THEMES[cfg.theme].name;
+      const char* tn = cfg.lang ? THEME_NAME_RU[cfg.theme < 4 ? cfg.theme : 0]
+                                : THEME_NAME[cfg.theme < 4 ? cfg.theme : 0];
       const char* an = cfg.accent < 8 ? (cfg.lang ? ACCENT_NAME_RU[cfg.accent] : ACCENT_NAME[cfg.accent]) : TR("custom", "свой");
       const char* sn = cfg.lang ? STYLE_NAME_RU[cfg.style] : STYLE_NAME[cfg.style];
-      char sub[10][56];
-      snprintf(sub[0], 56, TR("%s theme, %s accent", "%s, акцент: %s"), tn, an);
-      snprintf(sub[1], 56, TR("brightness %d%%, auto-dim %s", "яркость %d%%, затемнение: %s"), cfg.bright, dm);
-      snprintf(sub[2], 56, TR("%s, max %d, %s gauge", "%s, макс. %d, шкала: %s"), uSpd(), gmax(), sn);
-      snprintf(sub[3], 56, TR("4 cards, info %s, debug %s", "инфо: %s, отладка: %s"),
+      char sub[10][96];
+      snprintf(sub[0], 96, TR("%s theme, %s accent", "%s, акцент: %s"), tn, an);
+      snprintf(sub[1], 96, TR("brightness %d%%, auto-dim %s", "яркость %d%%, затемнение: %s"), cfg.bright, dm);
+      snprintf(sub[2], 96, TR("%s, max %d, %s gauge", "%s, макс. %d, шкала: %s"), uSpd(), gmax(), sn);
+      snprintf(sub[3], 96, TR("4 cards, info %s, debug %s", "инфо: %s, отладка: %s"),
                cfg.showInfo ? TR("on", "вкл") : TR("off", "выкл"), cfg.showDebug ? TR("on", "вкл") : TR("off", "выкл"));
-      snprintf(sub[4], 56, "%s", cfg.lang ? "Русский (нажмите: English)" : "English (tap: Русский)");
-      snprintf(sub[5], 56, "%s", TR("re-map the touch panel (3 taps)", "откалибровать сенсор (3 касания)"));
-      snprintf(sub[6], 56, TR("%d LEDs, GPIO %d, %d%%, %s", "%d св., GPIO %d, %d%%, %s"),
+      snprintf(sub[4], 96, "%s", cfg.lang ? "Русский (нажмите: English)" : "English (tap: Русский)");
+      snprintf(sub[5], 96, "%s", TR("re-map the touch panel (3 taps)", "откалибровать сенсор (3 касания)"));
+      snprintf(sub[6], 96, TR("%d LEDs, GPIO %d, %d%%, %s", "%d св., GPIO %d, %d%%, %s"),
                (int)ledCfg.count, (int)ledPin(), (int)ledCfg.bright * 100 / 255,
                ledCfg.enabled ? TR("on", "вкл") : TR("off", "выкл"));
-      snprintf(sub[7], 56, TR("web access %s", "веб-доступ: %s"),
+      snprintf(sub[7], 96, TR("web access %s", "веб-доступ: %s"),
                otaEnabled ? TR("on", "вкл") : TR("off", "выкл"));
-      snprintf(sub[8], 56, "%s", TR("custom firmware settings", "настройки прошивки SHFW"));
-      snprintf(sub[9], 56, "%s", TR("press and HOLD to restore defaults", "удерживайте для сброса"));
+      snprintf(sub[8], 96, "%s", TR("custom firmware settings", "настройки прошивки SHFW"));
+      snprintf(sub[9], 96, "%s", TR("press and HOLD to restore defaults", "удерживайте для сброса"));
       for (int i = 0; i < 10; i++) {
         int y = 32 + i * 28;
-        tft.fillRoundRect(8, y, 224, 27, 6, COL_PANEL);
-        tft.fillRect(8, y + 3, 3, 21, i == 9 ? COL_BAD : COL_ACCENT);
+        bool danger = (i == 9);
+        uint16_t fill = danger ? COL_ERROR_CONTAINER : COL_SURFACE_LOW;
+        tft.fillRoundRect(8, y, 224, 27, 13, fill);
+        tft.fillCircle(21, y + 13, 8, danger ? COL_BAD : COL_PRIMARY_CONTAINER);
+        tft.fillCircle(21, y + 13, 3, danger ? COL_ON_ERROR_CONTAINER : COL_ACCENT);
         tft.setTextDatum(TL_DATUM);
         tft.setTextPadding(0);
-        tft.setTextColor(i == 9 ? COL_BAD : COL_TXT, COL_PANEL);
-        drawS(titles[i], 20, y, 2);
-        tft.setTextColor(COL_DIM, COL_PANEL);
-        drawS(sub[i], 20, y + 16, 1);
+        tft.setTextColor(danger ? COL_BAD : COL_TXT, fill);
+        drawS(fitText(titles[i], 170, 2), 36, y, 2);
+        tft.setTextColor(danger ? COL_ON_ERROR_CONTAINER : COL_DIM, fill);
+        drawS(fitText(sub[i], 172, 1), 36, y + 16, 1);
         if (i != 4 && i != 9) {
-          tft.drawLine(216, y + 8, 222, y + 14, COL_DIM);
-          tft.drawLine(222, y + 14, 216, y + 20, COL_DIM);
+          tft.drawLine(217, y + 8, 223, y + 14, COL_OUTLINE);
+          tft.drawLine(223, y + 14, 217, y + 20, COL_OUTLINE);
         }
       }
       break;
@@ -2271,26 +2451,28 @@ void drawSettingsScreen() {
     case S_APPEAR: {
       settingsHeader(TR("APPEARANCE", "Внешний вид"));
       secLabel(8, 36, TR("THEME", "Тема"));
+      uint16_t accent = cfg.accent < 8 ? ACCENTS[cfg.accent] : hue565(cfg.hue);
       for (int i = 0; i < 4; i++) {
         int x = 8 + i * 58, y = 48;
-        const Theme& t = THEMES[i];
-        tft.fillRoundRect(x, y, 54, 40, 6, t.bg);
-        tft.drawRoundRect(x, y, 54, 40, 6, cfg.theme == i ? COL_ACCENT : COL_TRACK);
-        if (cfg.theme == i) tft.drawRoundRect(x + 1, y + 1, 52, 38, 5, COL_ACCENT);
-        tft.fillRoundRect(x + 6, y + 6, 42, 12, 3, t.panel);
+        UiColors tp = uiTheme((uint8_t)i, accent);
+        tft.fillRoundRect(x, y, 54, 40, 14, tp.surface);
+        tft.drawRoundRect(x, y, 54, 40, 14, cfg.theme == i ? tp.primary : tp.outlineVariant);
+        if (cfg.theme == i) tft.drawRoundRect(x + 1, y + 1, 52, 38, 13, tp.primary);
+        tft.fillRoundRect(x + 6, y + 6, 42, 10, 5, tp.surfaceContainer);
+        tft.fillRoundRect(x + 6, y + 21, 26, 5, 2, tp.primary);
         tft.setTextDatum(MC_DATUM);
-        tft.setTextColor(t.txt, t.bg);
+        tft.setTextColor(tp.onSurface, tp.surface);
         tft.setTextPadding(0);
-        drawS(cfg.lang ? t.nameRu : t.name, x + 27, y + 29, 1);
+        drawS(cfg.lang ? THEME_NAME_RU[i] : THEME_NAME[i], x + 27, y + 31, 1);
       }
       secLabel(8, 98, TR("ACCENT COLOR", "Цвет акцента"));
       for (int i = 0; i < 8; i++) {
         int x = 8 + (i % 4) * 58, y = 110 + (i / 4) * 38;
-        tft.fillRoundRect(x, y, 54, 34, 6, ACCENTS[i]);
+        tft.fillRoundRect(x, y, 54, 34, 14, ACCENTS[i]);
         if (cfg.accent == i) {
-          tft.drawRoundRect(x, y, 54, 34, 6, COL_TXT);
-          tft.drawRoundRect(x + 1, y + 1, 52, 32, 5, COL_TXT);
-          tft.fillCircle(x + 27, y + 17, 4, COL_BG);
+          tft.drawRoundRect(x, y, 54, 34, 14, COL_TXT);
+          tft.drawRoundRect(x + 1, y + 1, 52, 32, 13, COL_TXT);
+          tft.fillCircle(x + 27, y + 17, 5, uiInkOn(ACCENTS[i]));
         }
       }
       secLabel(8, 190, TR("CUSTOM HUE (drag)", "Свой оттенок (проведите пальцем)"));
@@ -2322,11 +2504,13 @@ void drawSettingsScreen() {
       secLabel(8, 104, TR("GAUGE MAX (step 3)", "Максимум шкалы (шаг 3)"));
       btn(8, 116, 64, 44, "-", false, 4);
       btn(168, 116, 64, 44, "+", false, 4);
+      tft.fillRect(80, 118, 80, 30, COL_BG);
       tft.setTextDatum(MC_DATUM);
       tft.setTextPadding(0);
       tft.setTextColor(COL_TXT, COL_BG);
       snprintf(b, sizeof(b), "%d", gmax());
       drawS(b, 120, 131, 4);
+      tft.fillRect(88, 145, 64, 14, COL_BG);
       tft.setTextColor(COL_DIM, COL_BG);
       drawS(uSpd(), 120, 150, 1);
       secLabel(8, 172, TR("GAUGE COLORS", "Цвета шкалы"));
@@ -2342,16 +2526,16 @@ void drawSettingsScreen() {
       secLabel(8, 36, TR("TAP A CARD TO CHOOSE ITS DATA", "Нажмите карточку, чтобы выбрать данные"));
       for (int i = 0; i < 4; i++) {
         int x = 8 + (i % 2) * 116, y = 48 + (i / 2) * 70;
-        tft.fillRoundRect(x, y, 108, 64, 6, COL_PANEL);
-        tft.fillRect(x, y + 12, 3, 40, COL_ACCENT);
+        tft.fillRoundRect(x, y, 108, 64, 16, COL_PANEL);
+        tft.fillRoundRect(x + 6, y + 12, 4, 40, 2, COL_ACCENT);
         snprintf(b, sizeof(b), TR("CARD %d", "Карточка %d"), i + 1);
         tft.setTextDatum(TL_DATUM);
         tft.setTextPadding(0);
         tft.setTextColor(COL_DIM, COL_PANEL);
-        drawS(b, x + 10, y + 8, 1);
+        drawS(b, x + 14, y + 8, 1);
         tft.setTextDatum(MC_DATUM);
         tft.setTextColor(COL_TXT, COL_PANEL);
-        drawS(metricName(cfg.card[i]), x + 54, y + 38, 2);
+        drawS(fitText(metricName(cfg.card[i]), 94, 2), x + 58, y + 38, 2);
       }
       secLabel(8, 194, TR("PAGES", "Страницы"));
       snprintf(b, sizeof(b), TR("INFO: %s", "Инфо: %s"), cfg.showInfo ? TR("ON", "вкл") : TR("OFF", "выкл"));
@@ -2367,42 +2551,48 @@ void drawSettingsScreen() {
       settingsHeader(TR("ARGB LED STRIP", "ARGB-лента"));
       secLabel(8, 30, TR("TOTAL LEDS", "Всего светодиодов"));
       btn(8, 40, 58, 26, "-", false, 2);
-      btnText(74, 40, 92, 26, String(ledCfg.count) + " LED", false, 1);
+      char tb[72];
+      snprintf(tb, sizeof(tb), "%d LED", ledCfg.count);
+      btnText(74, 40, 92, 26, tb, false, 1);
       btn(174, 40, 58, 26, "+", false, 2);
 
       drawLedBrightness();
 
-      btnText(8, 114, 108, 26, String("GPIO ") + ledPin(), false, 1);
+      snprintf(tb, sizeof(tb), "GPIO %d", ledPin());
+      btnText(8, 114, 108, 26, tb, false, 1);
       btnText(124, 114, 108, 26, ledCfg.enabled ? TR("STRIP: ON", "ЛЕНТА: ВКЛ") : TR("STRIP: OFF", "ЛЕНТА: ВЫКЛ"),
               ledCfg.enabled, 1);
       uint8_t brake = ledCfg.brake < LED_BRAKE_COUNT ? ledCfg.brake : LED_BRAKE_OFF;
-      btnText(8, 146, 224, 26,
-              String(TR("BRAKE LIGHT: ", "ТОРМОЖЕНИЕ: ")) + (cfg.lang ? LED_BRAKE_NAMES_RU[brake] : LED_BRAKE_NAMES[brake]),
-              brake != LED_BRAKE_OFF, 1);
+      const char* brakeName = cfg.lang ? LED_BRAKE_NAMES_RU[brake] : LED_BRAKE_NAMES[brake];
+      snprintf(tb, sizeof(tb), "%s%s", TR("BRAKE LIGHT: ", "ТОРМОЖЕНИЕ: "), brakeName);
+      btnText(8, 146, 224, 26, tb, brake != LED_BRAKE_OFF, 1);
 
       for (uint8_t i = 0; i < 3; i++) {
         int y = 180 + i * 46;
         uint16_t start = ledSegmentStart(i);
         uint16_t end = start + ledCfg.segmentCount[i];
-        tft.fillRoundRect(8, y, 224, 44, 6, COL_PANEL);
+        tft.fillRoundRect(8, y, 224, 44, 16, COL_PANEL);
         tft.setTextDatum(TL_DATUM);
         tft.setTextColor(COL_TXT, COL_PANEL);
         tft.setTextPadding(0);
-        String range = ledCfg.segmentCount[i]
-          ? String(start + 1) + "-" + String(end)
-          : String(TR("empty", "пусто"));
-        drawS(String(TR("SEG ", "СЕГМЕНТ ")) + String(i + 1) + ": " +
-              String(TR("LED ", "СВ ")) + range, 14, y + 2, 1);
+        char range[24];
+        if (ledCfg.segmentCount[i]) snprintf(range, sizeof(range), "%d-%d", start + 1, end);
+        else strcpy(range, TR("empty", "пусто"));
+        char lbl[64];
+        snprintf(lbl, sizeof(lbl), "%s%d: %s%s", TR("SEG ", "СЕГМЕНТ "), i + 1, TR("LED ", "СВ "), range);
+        drawS(lbl, 14, y + 2, 1);
         btn(14, y + 20, 28, 21, "-", false, 1);
-        btnText(45, y + 20, 34, 21, String(ledCfg.segmentCount[i]), false, 1);
+        char cnt[8];
+        snprintf(cnt, sizeof(cnt), "%d", ledCfg.segmentCount[i]);
+        btnText(45, y + 20, 34, 21, cnt, false, 1);
         btn(82, y + 20, 28, 21, "+", false, 1);
         uint8_t effect = ledCfg.effect[i] < LED_EFFECT_COUNT ? ledCfg.effect[i] : LED_OFF;
         btnText(114, y + 20, 68, 21,
                 cfg.lang ? LED_EFFECT_NAMES_RU[effect] : LED_EFFECT_NAMES[effect], false, 1);
-        tft.fillTriangle(188, y + 27, 194, y + 30, 188, y + 33, COL_DIM);
+        tft.fillTriangle(188, y + 27, 194, y + 30, 188, y + 33, COL_OUTLINE);
         uint16_t swatch = ledColor565(ledCfg.hue[i], ledCfg.sat[i], ledCfg.val[i]);
-        tft.fillRoundRect(196, y + 20, 32, 21, 4, swatch);
-        tft.drawRoundRect(196, y + 20, 32, 21, 4, COL_TXT);
+        tft.fillRoundRect(196, y + 20, 32, 21, 10, swatch);
+        tft.drawRoundRect(196, y + 20, 32, 21, 10, COL_OUTLINE_VAR);
       }
       break;
     }
@@ -2419,7 +2609,7 @@ void drawSettingsScreen() {
       secLabel(8, 200, TR("HUE", "ОТТЕНОК"));
       drawLedHueGradient();
       drawLedHueMarker();
-      btn(8, 254, 108, 38, TR("DONE", "ГОТОВО"), false, 2);
+      btn(8, 254, 108, 38, TR("DONE", "ГОТОВО"), true, 2);
       btn(124, 254, 108, 38, TR("CANCEL", "ОТМЕНА"), false, 2);
       secLabel(8, 298, TR("Drag the square = saturation/brightness.", "Квадрат: насыщенность и яркость."));
       break;
@@ -2443,9 +2633,13 @@ void drawSettingsScreen() {
               otaEnabled, 2);
       if (otaEnabled && otaApReady) {
         secLabel(8, 116, TR("CONNECT TO WI-FI", "ПОДКЛЮЧИТЕСЬ К WI-FI"));
-        drawS(String("SSID: ") + otaSsid, 8, 136, 1);
-        drawS(String(TR("PASSWORD: ", "ПАРОЛЬ: ")) + otaPassword, 8, 156, 1);
-        drawS(String("URL: http://") + WiFi.softAPIP().toString(), 8, 176, 1);
+        char line[72];
+        snprintf(line, sizeof(line), "SSID: %s", otaSsid);
+        drawS(line, 8, 136, 1);
+        snprintf(line, sizeof(line), "%s%s", TR("PASSWORD: ", "ПАРОЛЬ: "), otaPassword);
+        drawS(line, 8, 156, 1);
+        snprintf(line, sizeof(line), "URL: http://%s", WiFi.softAPIP().toString().c_str());
+        drawS(line, 8, 176, 1);
         secLabel(8, 216, TR("Open the URL and upload a .bin file.", "Откройте адрес и загрузите файл .bin."));
         secLabel(8, 232, TR("Keep power connected during update.", "Не отключайте питание во время обновления."));
       } else if (otaEnabled) {
@@ -2733,13 +2927,24 @@ void drawSettingsScreen() {
 }
 
 // ---------- Диспетчер экрана ----------
+static bool screenNeedsClear(Scr s) {
+  // These screens change their whole background (theme/rotation) or contain
+  // text that can shrink, so they keep the old full-clear path.
+  return s == S_APPEAR || s == S_DISPLAY || s == S_OTA || s == S_CAL || s >= S_SHFW;
+}
+
 void drawUi() {
+  static Scr drawnScr = (Scr)0xFF;
   bool live = connected && authState == AUTH_READY;
   int mode = scr != S_MAIN ? 100 + (int)scr : (live ? 1 + page : 0);
   if (mode != uiMode) {
+    bool clear = uiForceClear || scr != drawnScr || scr == S_MAIN || screenNeedsClear(scr);
     uiMode = mode;
     clearCache();
-    tft.fillScreen(COL_BG);
+    if (clear) tft.fillScreen(COL_BG);
+    // Keep CS asserted for the whole screen: dozens of primitives and text
+    // glyphs otherwise each pay a SPI transaction setup.
+    tft.startWrite();
     if (scr == S_MAIN) {
       drawHeaderStatic(mode > 0);
       stDirty = true;
@@ -2750,13 +2955,18 @@ void drawUi() {
     } else {
       drawSettingsScreen();
     }
+    tft.endWrite();
+    drawnScr = scr;
+    uiForceClear = false;
   }
   if (scr != S_MAIN) return;
+  tft.startWrite();
   if (stDirty) drawStatus();
   if (mode == 0) connectDynamic();
   else if (mode == 1) dashDynamic();
   else if (mode == 2) infoDynamic();
   else debugDynamic();
+  tft.endWrite();
 }
 
 // =====================================================================
@@ -3300,7 +3510,7 @@ void touchSettings() {
         if (!hit(x, y, 8, 32 + i * 28, 224, 27)) continue;
         if (tch.evTap) {
           if (i <= 3) goScr((Scr)(S_APPEAR + i));
-          else if (i == 4) { cfg.lang ^= 1; queueSave(); uiMode = -1; }      // язык переключается сразу
+          else if (i == 4) { cfg.lang ^= 1; queueSave(); uiForceClear = true; uiMode = -1; }      // язык переключается сразу
           else if (i == 5) { calStep = 0; calFail = false; calFromBoot = false; goScr(S_CAL); }
           else if (i == 6) goScr(S_LED);
           else if (i == 7) goScr(S_OTA);

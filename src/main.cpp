@@ -230,6 +230,10 @@ volatile uint32_t frameCount = 0;
 volatile uint32_t checksumErrors = 0;
 volatile uint32_t txCount = 0;
 volatile uint32_t txFailures = 0;
+static bool telemetryPending = false;
+static uint8_t telemetryPendingDev = 0;
+static uint8_t telemetryPendingReg = 0;
+static uint32_t telemetryPendingAt = 0;
 uint8_t lastNotify[20] = {};
 volatile uint8_t lastNotifyLen = 0;
 volatile uint32_t txCounter = 0;
@@ -522,11 +526,17 @@ void handlePlainFrame(const uint8_t* f, size_t n) {
   if (src == ADDR_ESC && arg == 0x26 && len >= 2) {
     d.speed = fabsf(s16(p) * SPEED_SCALE);
     d.valid |= (uint16_t)(1U << SPEED);
+    if (telemetryPending && telemetryPendingDev == src && telemetryPendingReg == arg) {
+      telemetryPending = false;
+    }
     return;
   }
   if (src == ADDR_BMS && arg == 0x33 && len >= 2) {
     d.amp = s16(p) * BMS_CUR_SCALE;
     d.valid |= (uint16_t)(1U << AMP);
+    if (telemetryPending && telemetryPendingDev == src && telemetryPendingReg == arg) {
+      telemetryPending = false;
+    }
     if ((d.valid & (1U << SPEED)) && d.speed > 3.0f &&
         d.amp <= -BRAKE_REGEN_CURRENT_A) {
       brakeUntil = millis() + BRAKE_HOLD_MS;
@@ -558,6 +568,9 @@ void handlePlainFrame(const uint8_t* f, size_t n) {
       case RIDE_MODE: d.rideMode = u16(p); break;
     }
     d.valid |= (uint16_t)(1U << it.id);
+    if (telemetryPending && telemetryPendingDev == src && telemetryPendingReg == arg) {
+      telemetryPending = false;
+    }
   }
 }
 
@@ -3972,18 +3985,39 @@ void loop() {
   serviceAuth();
 
   if (authState == AUTH_READY && now - lastFastPoll >= FAST_TELEMETRY_POLL_MS) {
-    lastFastPoll = now;
-    if (pollBrakeCurrent) sendRead(ADDR_BMS, 0x33, 2);
-    else sendRead(ADDR_ESC, 0x26, 2);
-    pollBrakeCurrent = !pollBrakeCurrent;
+    if (!telemetryPending) {
+      lastFastPoll = now;
+      if (pollBrakeCurrent) {
+        sendRead(ADDR_BMS, 0x33, 2);
+        telemetryPendingDev = ADDR_BMS;
+        telemetryPendingReg = 0x33;
+      } else {
+        sendRead(ADDR_ESC, 0x26, 2);
+        telemetryPendingDev = ADDR_ESC;
+        telemetryPendingReg = 0x26;
+      }
+      telemetryPendingAt = now;
+      telemetryPending = true;
+      pollBrakeCurrent = !pollBrakeCurrent;
+    }
   }
 
-  if (authState == AUTH_READY && now - lastPoll >= POLL_INTERVAL) {
+  if (authState == AUTH_READY && !telemetryPending &&
+      now - lastPoll >= POLL_INTERVAL) {
     lastPoll = now;
     const Item& it = pollList[idx];
     idx = (idx + 1) % POLL_N;
     bool slowDone = (it.id == SERIAL_NO && d.serial[0]) || (it.id == FW && d.fw);
-    if (!slowDone) sendRead(it.dev, it.reg, it.len);
+    if (!slowDone) {
+      sendRead(it.dev, it.reg, it.len);
+      telemetryPendingDev = it.dev;
+      telemetryPendingReg = it.reg;
+      telemetryPendingAt = now;
+      telemetryPending = true;
+    }
+  }
+  if (telemetryPending && now - telemetryPendingAt > 1200) {
+    telemetryPending = false;
   }
 
   if (now - lastDraw >= 90) {

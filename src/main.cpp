@@ -18,7 +18,8 @@
 #include <Update.h>
 #include <esp_system.h>
 #include <XPT2046_Touchscreen.h>
-#include <Adafruit_NeoPixel.h>
+#include <NeoPixelBus.h>
+#include <new>
 #define LEDFX_IMPLEMENTATION
 #include "led_effects.h"
 #include "ui_theme.h"
@@ -43,6 +44,9 @@
 #define BRAKE_HOLD_MS 700
 #define FAST_TELEMETRY_POLL_MS 200
 #define LED_MAX_COUNT 120
+#ifndef OPENDASH_TRACE_TELEMETRY
+#define OPENDASH_TRACE_TELEMETRY 0
+#endif
 
 static const uint8_t LED_PINS[] = {4, 16, 17, 22, 26, 27};
 static const uint8_t LED_PIN_COUNT = sizeof(LED_PINS) / sizeof(LED_PINS[0]);
@@ -172,7 +176,8 @@ static const char* const LED_BRAKE_NAMES[] = {"OFF", "ALL", "REAR SEG"};
 static const char* const LED_BRAKE_NAMES_RU[] = {"ВЫКЛ", "ВСЯ ЛЕНТА", "ЗАДНИЙ СЕГМЕНТ"};
 
 TFT_eSPI tft;
-Adafruit_NeoPixel ledStrip(30, LED_PINS[3], NEO_GRB + NEO_KHZ800);
+using LedStrip = NeoPixelBus<NeoGrbFeature, Neo800KbpsMethod>;
+static LedStrip* ledStrip = nullptr;
 static bool ledReady = false;
 static uint32_t brakeUntil = 0;
 static uint8_t ledColorSeg = 0;                 // сегмент, который сейчас выбирают
@@ -188,7 +193,7 @@ static uint32_t ledSig = 0;
 static bool ledWasOn = false;
 
 static void ledSinkSet(void* ctx, uint16_t index, uint8_t r, uint8_t g, uint8_t b) {
-  static_cast<Adafruit_NeoPixel*>(ctx)->setPixelColor(index, Adafruit_NeoPixel::Color(r, g, b));
+  static_cast<LedStrip*>(ctx)->SetPixelColor(index, RgbColor(r, g, b));
 }
 
 // ---------- Цвета ARGB-ленты (HSV) ----------
@@ -543,9 +548,11 @@ void handlePlainFrame(const uint8_t* f, size_t n) {
     }
     return;
   }
+#if OPENDASH_TRACE_TELEMETRY
   Serial.printf("RX REG dev=%02X reg=%02X len=%u data=", src, arg, len);
   for (uint8_t i = 0; i < len; i++) Serial.printf("%02X", p[i]);
   Serial.println();
+#endif
   for (int i = 0; i < POLL_N; i++) {
     const Item& it = pollList[i];
     if (it.dev != src || it.reg != arg || len < it.len) continue;
@@ -1349,14 +1356,22 @@ void queueSave() { saveDue = true; saveAt = millis() + 1200; }
 uint8_t ledPin() { return LED_PINS[ledCfg.pinIndex]; }
 
 void applyLedHardware() {
-  ledStrip.setPin(ledPin());
-  ledStrip.updateLength(ledCfg.count);
-  ledStrip.begin();
-  // The library keeps the buffer at full scale; led_effects applies the
-  // configured brightness itself (and never rescales the buffer twice).
-  ledStrip.setBrightness(255);
-  ledStrip.clear();
-  ledStrip.show();
+  if (ledStrip) {
+    ledStrip->ClearTo(RgbColor(0));
+    ledStrip->Show();
+    delete ledStrip;
+    ledStrip = nullptr;
+  }
+  ledReady = false;
+  LedStrip* strip = new (std::nothrow) LedStrip(ledCfg.count, ledPin());
+  if (!strip) {
+    Serial.println("ERROR: NeoPixelBus initialization failed");
+    return;
+  }
+  strip->Begin();
+  ledStrip = strip;
+  ledStrip->ClearTo(RgbColor(0));
+  ledStrip->Show();
   ledfx_reset(&ledState);
   ledSig = 0;
   ledWasOn = false;
@@ -1430,7 +1445,7 @@ void saveLedSettings() {
 
 // ---------- Эффекты ARGB-ленты ----------
 // Рендерер живёт в led_effects.h: он не зависит от Arduino и проверяется
-// отдельным host-тестом (tools/test_led.c). Здесь только адаптер к NeoPixel.
+// отдельным host-тестом (tools/test_led.c). Здесь только адаптер к NeoPixelBus.
 
 static uint32_t ledConfigSignature(const LedfxConfig& c, bool braking) {
   uint32_t h = 2166136261u;
@@ -1469,8 +1484,8 @@ void serviceLedStrip() {
 
   if (!ledCfg.enabled) {
     if (ledWasOn) {
-      ledStrip.clear();
-      ledStrip.show();
+      ledStrip->ClearTo(RgbColor(0));
+      ledStrip->Show();
       ledWasOn = false;
       ledfx_reset(&ledState);
       ledSig = 0;
@@ -1495,9 +1510,9 @@ void serviceLedStrip() {
 
   LedfxSink sink;
   sink.set = ledSinkSet;
-  sink.ctx = &ledStrip;
+  sink.ctx = ledStrip;
   ledfx_render(&sink, &c, &ledState, now, braking ? 1 : 0);
-  ledStrip.show();
+  ledStrip->Show();
   ledSig = sig;
 }
 
@@ -3463,9 +3478,7 @@ void touchSettings() {
     } else if (dragId == 3) {
       int bv = 1 + (int)(f * 254);
       if (bv != ledCfg.bright) {
-        // Brightness is applied by the effect renderer on the next frame;
-        // pushing it through NeoPixel::setBrightness would rescale the
-        // buffer a second time and make the fade uneven.
+        // Brightness is applied per pixel by the effect renderer.
         ledCfg.bright = bv;
         drawLedBrightness();
       }

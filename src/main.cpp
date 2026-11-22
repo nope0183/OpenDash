@@ -337,6 +337,7 @@ static bool loadAuthCredential(const String& name, const uint8_t serial[14],
   size_t size = authPrefs.getBytesLength("credential");
   if (size == 0) {
     authPrefs.end();
+    Serial.println("No saved Ninebot pairing key");
     return false;
   }
   if (size != sizeof(AuthCredential)) {
@@ -354,10 +355,13 @@ static bool loadAuthCredential(const String& name, const uint8_t serial[14],
     Serial.println("ERROR: invalid saved Ninebot pairing record");
     return false;
   }
-  if (name.length() != saved.nameLength ||
-      memcmp(name.c_str(), saved.name, saved.nameLength) != 0 ||
-      memcmp(serial, saved.serial, sizeof(saved.serial)) != 0) {
+  if (memcmp(serial, saved.serial, sizeof(saved.serial)) != 0) {
+    Serial.println("Saved Ninebot key belongs to a different scooter serial");
     return false;
+  }
+  if (name.length() != saved.nameLength ||
+      memcmp(name.c_str(), saved.name, saved.nameLength) != 0) {
+    Serial.println("Scooter BLE name changed; reusing saved key by serial");
   }
   memcpy(appKey, saved.appKey, sizeof(saved.appKey));
   return true;
@@ -595,6 +599,8 @@ void handlePlainFrame(const uint8_t* f, size_t n) {
       status("READY", COL_GOOD);
       Serial.println("AUTH READY; telemetry enabled (SHFW writes stay locked until unlocked on screen)");
     } else {
+      Serial.printf("PAIR response arg=%02X (attempt %u)\n",
+                    (unsigned)arg, (unsigned)authPairAttempts);
       if (authAppKeyReused && authPairAttempts >= 3) {
         authPairFallbackRequested = true;
       } else {

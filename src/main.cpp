@@ -269,6 +269,7 @@ static volatile bool authInitReceived = false;
 static volatile bool authPairConfirmed = false;
 static bool authAppKeyReused = false;
 static uint8_t authPingRetries = 0;
+static uint8_t authPairRetries = 0;
 static constexpr size_t AUTH_DEVICE_NAME_CAPACITY = 32;
 
 struct AuthCredential {
@@ -551,12 +552,15 @@ void handlePlainFrame(const uint8_t* f, size_t n) {
   }
   if (src == 0x21 && dst == ADDR_APP && cmd == 0x5C && authState == AUTH_WAIT_PING) {
     authLastSend = millis();
-    if (arg == 0x01) {
+    if (arg == 0x01 || authAppKeyReused) {
       pressPowerRequired = false;
       authState = AUTH_WAIT_PAIR;
+      authPairRetries = 0;
       pendingTx = TX_PAIR;
       status("PAIRING", COL_ACCENT);
-      Serial.println("POWER CONFIRMED; sending PAIR");
+      Serial.println(authAppKeyReused
+                     ? "Saved app key accepted for PAIR attempt"
+                     : "POWER CONFIRMED; sending PAIR");
     } else {
       pressPowerRequired = true;
       status("PRESS POWER", COL_WARN);
@@ -1113,6 +1117,11 @@ void serviceAuth() {
     pendingTx = TX_PING;
     authLastSend = now;
   } else if (authState == AUTH_WAIT_PAIR && now - authLastSend > 1500) {
+    authPairRetries++;
+    if (authAppKeyReused && authPairRetries >= 3) {
+      pressPowerRequired = true;
+      status("PRESS POWER", COL_WARN);
+    }
     pendingTx = TX_PAIR;
     authLastSend = now;
   }
@@ -1122,6 +1131,7 @@ void servicePendingTx() {
   if (authInitReceived) {
     authInitReceived = false;
     authPingRetries = 0;
+    authPairRetries = 0;
     uint8_t savedKey[sizeof(randomAppData)];
     authAppKeyReused = loadAuthCredential(devName, scooterSerial, savedKey);
     if (authAppKeyReused) {
@@ -3992,6 +4002,7 @@ class ClientCB : public NimBLEClientCallbacks {
     authPairConfirmed = false;
     authAppKeyReused = false;
     authPingRetries = 0;
+    authPairRetries = 0;
   }
 } clientCB;
 
@@ -4047,7 +4058,7 @@ bool scanAndConnect() {
   rxLen = 0; rxExpected = 0; lastRx = millis(); connected = true; d.valid = 0;
   txCounter = 0; rxCounter = 0; pressPowerRequired = false;
   authInitReceived = false; authPairConfirmed = false;
-  authAppKeyReused = false; authPingRetries = 0;
+  authAppKeyReused = false; authPingRetries = 0; authPairRetries = 0;
   authState = AUTH_WAIT_INIT; pendingTx = TX_INIT; authLastSend = millis();
   d.totalLow = 0; d.totalHigh = 0; d.tripKm = 0; sessionMax = 0;
   brakeUntil = 0;

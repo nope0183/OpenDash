@@ -4,37 +4,37 @@ The manifests write one complete factory image at offset `0x0`:
 
 | File | Flash layout |
 | --- | --- |
-| `OpenDash-v2.2.3-cyd_2usb-factory.bin` | bootloader `0x1000`, partitions `0x8000`, boot_app0 `0xE000`, app `0x10000` |
-| `OpenDash-v2.2.3-cyd_ili9341-factory.bin` | same, with the ILI9341 app |
+| `OpenDash-v2.2.4-cyd_2usb-factory.bin` | bootloader `0x1000`, partitions `0x8000`, boot_app0 `0xE000`, app `0x10000` |
+| `OpenDash-v2.2.4-cyd_ili9341-factory.bin` | same, with the ILI9341 app |
 
 Individual components are kept for transparency and manual flashing:
 
 | File | Offset | Origin |
 | --- | ---: | --- |
-| `bootloader.bin` | `0x1000` | PlatformIO build for `cyd_2usb`, v2.2.3 |
-| `partitions.bin` | `0x8000` | `partitions_ota.csv`, v2.2.3 |
+| `bootloader.bin` | `0x1000` | PlatformIO build for `cyd_2usb`, v2.2.4 |
+| `partitions.bin` | `0x8000` | `partitions_ota.csv`, v2.2.4 |
 | `boot_app0.bin` | `0xE000` | Arduino-ESP32 framework (initial OTA selection) |
-| `OpenDash-v2.2.3-cyd_2usb.bin` | `0x10000` | `pio run -e cyd_2usb`, v2.2.3 |
-| `OpenDash-v2.2.3-cyd_ili9341.bin` | `0x10000` | `pio run -e cyd_ili9341`, v2.2.3 |
+| `OpenDash-v2.2.4-cyd_2usb.bin` | `0x10000` | `pio run -e cyd_2usb`, v2.2.4 |
+| `OpenDash-v2.2.4-cyd_ili9341.bin` | `0x10000` | `pio run -e cyd_ili9341`, v2.2.4 |
 
-The `v2.2.3` application images contain the Material You UI
+The `v2.2.4` application images contain the Material You UI
 (`src/ui_theme.h`), the ARGB renderer (`src/led_effects.h`), NeoPixelBus
-hardware output for the LED strip, and persistent Ninebot pairing-key reuse.
+hardware output for the LED strip, and bug-fixed persistent Ninebot pairing-key reuse.
 The app image hashes are:
 
 ```text
-6d869016a3be09c2aed298e9ac7a732112f2b9a406c3ea65ce8e630b71331633  OpenDash-v2.2.3-cyd_2usb.bin
-fa45583928bc6fa06cd3380bba975d20e539aab29889b7cf21545c193664c4cd  OpenDash-v2.2.3-cyd_ili9341.bin
+d1a20a037b08bdbd00c3d29ff7a5dbaee7d6dba79480fbb63e852048a0ab1660  OpenDash-v2.2.4-cyd_2usb.bin
+f6b3e70efc9304f466142d37d4454cdf8f84c5fcbe00b801f976390123d773e7  OpenDash-v2.2.4-cyd_ili9341.bin
 ```
 
 The factory images were assembled with:
 
 ```text
 esptool.py --chip esp32 merge_bin \
-  -o OpenDash-v2.2.3-cyd_2usb-factory.bin \
+  -o OpenDash-v2.2.4-cyd_2usb-factory.bin \
   --flash_mode dio --flash_freq 40m --flash_size 4MB \
   0x1000 bootloader.bin 0x8000 partitions.bin \
-  0xe000 boot_app0.bin 0x10000 OpenDash-v2.2.3-cyd_2usb.bin
+  0xe000 boot_app0.bin 0x10000 OpenDash-v2.2.4-cyd_2usb.bin
 ```
 
 The second display variant shares the bootloader and partition table; only the

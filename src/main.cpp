@@ -267,9 +267,11 @@ static uint32_t authLastSend = 0;
 static uint32_t lastCommand = 0;
 static volatile bool authInitReceived = false;
 static volatile bool authPairConfirmed = false;
+static volatile bool authPairFallbackRequested = false;
 static bool authAppKeyReused = false;
+static bool authSavedKeyRejectedThisBoot = false;
 static uint8_t authPingRetries = 0;
-static uint8_t authPairRetries = 0;
+static uint8_t authPairAttempts = 0;
 static constexpr size_t AUTH_DEVICE_NAME_CAPACITY = 32;
 
 struct AuthCredential {
@@ -385,7 +387,24 @@ static bool saveAuthCredential() {
     Serial.println("ERROR: failed to save Ninebot pairing key");
     return false;
   }
+  authSavedKeyRejectedThisBoot = false;
   return true;
+}
+
+static void rejectSavedAuthCredential() {
+  authSavedKeyRejectedThisBoot = true;
+  if (!authPrefs.begin("nbpair", false)) {
+    Serial.println("ERROR: cannot open Ninebot pairing storage to clear rejected key");
+  } else {
+    if (!authPrefs.remove("credential")) {
+      Serial.println("ERROR: failed to clear rejected Ninebot pairing key");
+    }
+    authPrefs.end();
+  }
+  Serial.println("Saved key rejected; reconnecting for fresh button pairing");
+  authState = AUTH_IDLE;
+  pendingTx = TX_NONE;
+  if (client && client->isConnected()) client->disconnect();
 }
 
 bool cryptoFirst(const uint8_t* input, uint8_t* output, size_t length) {
@@ -522,7 +541,7 @@ bool decryptPacket(const uint8_t* encrypted, size_t encryptedLength, uint8_t* pl
   } else if (nextCounter > messageCounter) {
     if (!cryptoNext(encrypted + 3, plain + 3, payloadLength, nextCounter)) return false;
     if (plainLength >= 7 && plain[3] == 0x21 && plain[4] == ADDR_APP &&
-        plain[5] == 0x5C && (plain[6] == 0x01 || authAppKeyReused)) {
+        plain[5] == 0x5C && plain[6] == 0x01) {
       setShaKey(randomAppData, randomBleData);
     }
     messageCounter = nextCounter;
@@ -552,15 +571,13 @@ void handlePlainFrame(const uint8_t* f, size_t n) {
   }
   if (src == 0x21 && dst == ADDR_APP && cmd == 0x5C && authState == AUTH_WAIT_PING) {
     authLastSend = millis();
-    if (arg == 0x01 || authAppKeyReused) {
+    if (arg == 0x01) {
       pressPowerRequired = false;
       authState = AUTH_WAIT_PAIR;
-      authPairRetries = 0;
+      authPairAttempts = 0;
       pendingTx = TX_PAIR;
       status("PAIRING", COL_ACCENT);
-      Serial.println(authAppKeyReused
-                     ? "Saved app key accepted for PAIR attempt"
-                     : "POWER CONFIRMED; sending PAIR");
+      Serial.println("POWER CONFIRMED; sending PAIR");
     } else {
       pressPowerRequired = true;
       status("PRESS POWER", COL_WARN);
@@ -578,7 +595,11 @@ void handlePlainFrame(const uint8_t* f, size_t n) {
       status("READY", COL_GOOD);
       Serial.println("AUTH READY; telemetry enabled (SHFW writes stay locked until unlocked on screen)");
     } else {
-      pendingTx = TX_PAIR;
+      if (authAppKeyReused && authPairAttempts >= 3) {
+        authPairFallbackRequested = true;
+      } else {
+        pendingTx = TX_PAIR;
+      }
     }
     return;
   }
@@ -750,6 +771,7 @@ void sendPing() {
 void sendPair() {
   authState = AUTH_WAIT_PAIR;
   authLastSend = millis();
+  if (authAppKeyReused) authPairAttempts++;
   sendPacket(0x21, 0x5D, 0, scooterSerial, sizeof(scooterSerial));
 }
 
@@ -1117,36 +1139,45 @@ void serviceAuth() {
     pendingTx = TX_PING;
     authLastSend = now;
   } else if (authState == AUTH_WAIT_PAIR && now - authLastSend > 1500) {
-    authPairRetries++;
-    if (authAppKeyReused && authPairRetries >= 3) {
-      pressPowerRequired = true;
-      status("PRESS POWER", COL_WARN);
+    if (authAppKeyReused && authPairAttempts >= 3) {
+      authPairFallbackRequested = true;
+    } else {
+      pendingTx = TX_PAIR;
+      authLastSend = now;
     }
-    pendingTx = TX_PAIR;
-    authLastSend = now;
   }
 }
 
 void servicePendingTx() {
+  if (authPairFallbackRequested) {
+    authPairFallbackRequested = false;
+    rejectSavedAuthCredential();
+    return;
+  }
+
   if (authInitReceived) {
     authInitReceived = false;
     authPingRetries = 0;
-    authPairRetries = 0;
+    authPairAttempts = 0;
     uint8_t savedKey[sizeof(randomAppData)];
-    authAppKeyReused = loadAuthCredential(devName, scooterSerial, savedKey);
+    authAppKeyReused = !authSavedKeyRejectedThisBoot &&
+                       loadAuthCredential(devName, scooterSerial, savedKey);
     if (authAppKeyReused) {
       memcpy(randomAppData, savedKey, sizeof(randomAppData));
       pressPowerRequired = false;
-      status("AUTH KEY", COL_ACCENT);
-      Serial.println("INIT OK; reusing saved Ninebot app key");
+      setShaKey(randomAppData, randomBleData);
+      authState = AUTH_WAIT_PAIR;
+      pendingTx = TX_PAIR;
+      status("PAIRING", COL_ACCENT);
+      Serial.println("INIT OK; saved app key -> direct PAIR");
     } else {
       for (uint8_t& byte : randomAppData) byte = (uint8_t)esp_random();
       pressPowerRequired = true;
       status("PRESS POWER", COL_WARN);
       Serial.println("INIT OK; new pairing requires power-button confirmation");
+      authState = AUTH_WAIT_PING;
+      pendingTx = TX_PING;
     }
-    authState = AUTH_WAIT_PING;
-    pendingTx = TX_PING;
     authLastSend = millis();
   }
   if (authPairConfirmed) {
@@ -4001,8 +4032,9 @@ class ClientCB : public NimBLEClientCallbacks {
     authInitReceived = false;
     authPairConfirmed = false;
     authAppKeyReused = false;
+    authPairFallbackRequested = false;
     authPingRetries = 0;
-    authPairRetries = 0;
+    authPairAttempts = 0;
   }
 } clientCB;
 
@@ -4058,7 +4090,8 @@ bool scanAndConnect() {
   rxLen = 0; rxExpected = 0; lastRx = millis(); connected = true; d.valid = 0;
   txCounter = 0; rxCounter = 0; pressPowerRequired = false;
   authInitReceived = false; authPairConfirmed = false;
-  authAppKeyReused = false; authPingRetries = 0; authPairRetries = 0;
+  authPairFallbackRequested = false;
+  authAppKeyReused = false; authPingRetries = 0; authPairAttempts = 0;
   authState = AUTH_WAIT_INIT; pendingTx = TX_INIT; authLastSend = millis();
   d.totalLow = 0; d.totalHigh = 0; d.tripKm = 0; sessionMax = 0;
   brakeUntil = 0;

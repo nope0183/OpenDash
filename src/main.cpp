@@ -265,6 +265,23 @@ static uint8_t scooterSerial[14] = {};
 static uint32_t messageCounter = 0;
 static uint32_t authLastSend = 0;
 static uint32_t lastCommand = 0;
+static volatile bool authInitReceived = false;
+static volatile bool authPairConfirmed = false;
+static bool authAppKeyReused = false;
+static uint8_t authPingRetries = 0;
+static constexpr size_t AUTH_DEVICE_NAME_CAPACITY = 32;
+
+struct AuthCredential {
+  uint32_t magic;
+  uint8_t version;
+  uint8_t nameLength;
+  char name[AUTH_DEVICE_NAME_CAPACITY];
+  uint8_t serial[14];
+  uint8_t appKey[16];
+};
+static constexpr uint32_t AUTH_CREDENTIAL_MAGIC = 0x4B41504FUL;
+static constexpr uint8_t AUTH_CREDENTIAL_VERSION = 1;
+static Preferences authPrefs;
 
 static inline uint16_t u16(const uint8_t* p) { return p[0] | (p[1] << 8); }
 static inline int16_t  s16(const uint8_t* p) { return (int16_t)u16(p); }
@@ -306,6 +323,68 @@ void resetCrypto(const std::string& name) {
   messageCounter = 0;
   rxLen = 0;
   rxExpected = 0;
+}
+
+static bool loadAuthCredential(const String& name, const uint8_t serial[14],
+                               uint8_t appKey[16]) {
+  if (!authPrefs.begin("nbpair", false)) {
+    Serial.println("ERROR: cannot open Ninebot pairing storage");
+    return false;
+  }
+  size_t size = authPrefs.getBytesLength("credential");
+  if (size == 0) {
+    authPrefs.end();
+    return false;
+  }
+  if (size != sizeof(AuthCredential)) {
+    authPrefs.end();
+    Serial.println("ERROR: invalid saved Ninebot pairing record");
+    return false;
+  }
+
+  AuthCredential saved = {};
+  size_t read = authPrefs.getBytes("credential", &saved, sizeof(saved));
+  authPrefs.end();
+  if (read != sizeof(saved) || saved.magic != AUTH_CREDENTIAL_MAGIC ||
+      saved.version != AUTH_CREDENTIAL_VERSION ||
+      saved.nameLength == 0 || saved.nameLength >= sizeof(saved.name)) {
+    Serial.println("ERROR: invalid saved Ninebot pairing record");
+    return false;
+  }
+  if (name.length() != saved.nameLength ||
+      memcmp(name.c_str(), saved.name, saved.nameLength) != 0 ||
+      memcmp(serial, saved.serial, sizeof(saved.serial)) != 0) {
+    return false;
+  }
+  memcpy(appKey, saved.appKey, sizeof(saved.appKey));
+  return true;
+}
+
+static bool saveAuthCredential() {
+  if (devName.length() == 0 || devName.length() >= AUTH_DEVICE_NAME_CAPACITY) {
+    Serial.println("ERROR: invalid scooter name; pairing key was not saved");
+    return false;
+  }
+
+  AuthCredential saved = {};
+  saved.magic = AUTH_CREDENTIAL_MAGIC;
+  saved.version = AUTH_CREDENTIAL_VERSION;
+  saved.nameLength = devName.length();
+  memcpy(saved.name, devName.c_str(), saved.nameLength);
+  memcpy(saved.serial, scooterSerial, sizeof(saved.serial));
+  memcpy(saved.appKey, randomAppData, sizeof(saved.appKey));
+
+  if (!authPrefs.begin("nbpair", false)) {
+    Serial.println("ERROR: cannot open Ninebot pairing storage for saving");
+    return false;
+  }
+  size_t written = authPrefs.putBytes("credential", &saved, sizeof(saved));
+  authPrefs.end();
+  if (written != sizeof(saved)) {
+    Serial.println("ERROR: failed to save Ninebot pairing key");
+    return false;
+  }
+  return true;
 }
 
 bool cryptoFirst(const uint8_t* input, uint8_t* output, size_t length) {
@@ -467,13 +546,7 @@ void handlePlainFrame(const uint8_t* f, size_t n) {
   pushDbg(f, n);
 
   if (src == 0x21 && dst == ADDR_APP && cmd == 0x5B && authState == AUTH_WAIT_INIT) {
-    for (uint8_t& byte : randomAppData) byte = (uint8_t)esp_random();
-    authState = AUTH_WAIT_PING;
-    pressPowerRequired = true;
-    pendingTx = TX_PING;
-    authLastSend = millis();
-    status("PRESS POWER", COL_WARN);
-    Serial.println("INIT OK; sending PING, press the scooter power button when prompted");
+    authInitReceived = true;
     return;
   }
   if (src == 0x21 && dst == ADDR_APP && cmd == 0x5C && authState == AUTH_WAIT_PING) {
@@ -496,6 +569,7 @@ void handlePlainFrame(const uint8_t* f, size_t n) {
     if (arg == 0x01) {
       authState = AUTH_READY;
       pressPowerRequired = false;
+      authPairConfirmed = true;
       lastRx = millis();
       status("READY", COL_GOOD);
       Serial.println("AUTH READY; telemetry enabled (SHFW writes stay locked until unlocked on screen)");
@@ -1031,6 +1105,11 @@ void serviceAuth() {
   if (authState == AUTH_WAIT_INIT && now - authLastSend > 5000) {
     if (client && client->isConnected()) client->disconnect();
   } else if (authState == AUTH_WAIT_PING && now - authLastSend > 1000) {
+    authPingRetries++;
+    if (authAppKeyReused && authPingRetries >= 3) {
+      pressPowerRequired = true;
+      status("PRESS POWER", COL_WARN);
+    }
     pendingTx = TX_PING;
     authLastSend = now;
   } else if (authState == AUTH_WAIT_PAIR && now - authLastSend > 1500) {
@@ -1040,6 +1119,33 @@ void serviceAuth() {
 }
 
 void servicePendingTx() {
+  if (authInitReceived) {
+    authInitReceived = false;
+    authPingRetries = 0;
+    uint8_t savedKey[sizeof(randomAppData)];
+    authAppKeyReused = loadAuthCredential(devName, scooterSerial, savedKey);
+    if (authAppKeyReused) {
+      memcpy(randomAppData, savedKey, sizeof(randomAppData));
+      pressPowerRequired = false;
+      status("AUTH KEY", COL_ACCENT);
+      Serial.println("INIT OK; reusing saved Ninebot app key");
+    } else {
+      for (uint8_t& byte : randomAppData) byte = (uint8_t)esp_random();
+      pressPowerRequired = true;
+      status("PRESS POWER", COL_WARN);
+      Serial.println("INIT OK; new pairing requires power-button confirmation");
+    }
+    authState = AUTH_WAIT_PING;
+    pendingTx = TX_PING;
+    authLastSend = millis();
+  }
+  if (authPairConfirmed) {
+    authPairConfirmed = false;
+    if (!saveAuthCredential()) {
+      Serial.println("Pairing succeeded, but the app key was not saved");
+    }
+  }
+
   PendingTx pending = pendingTx;
   if (pending == TX_NONE || !connected) return;
   pendingTx = TX_NONE;
@@ -1122,7 +1228,7 @@ String statusText(const char* s) {
   if (!cfg.lang) return String(s);
   static const char* const M[][2] = {
     {"AUTH INIT", "Авторизация"}, {"PRESS POWER", "Нажмите кнопку"}, {"PAIRING", "Сопряжение"},
-    {"NO LINK", "Нет связи"}, {"scan...", "Поиск..."}, {"not found", "Не найден"},
+    {"AUTH KEY", "Ключ авторизации"}, {"NO LINK", "Нет связи"}, {"scan...", "Поиск..."}, {"not found", "Не найден"},
     {"conn fail", "Сбой подключения"}, {"no NUS", "Нет NUS"}, {"chr fail", "Ошибка BLE"},
     {"link lost", "Связь потеряна"}, {"READY", "Готово"}};
   for (auto& m : M) if (!strcmp(s, m[0])) return String(m[1]);
@@ -2084,10 +2190,14 @@ void connectDynamic() {
                    lerp565(COL_SURFACE_HIGH, base, alpha));
   }
 
-  const char* titles[4] = {TR("SEARCHING", "Поиск"), TR("CONNECTING", "Подключение"), TR("PRESS POWER", "Нажмите кнопку"), TR("PAIRING", "Сопряжение")};
+  const char* titles[4] = {TR("SEARCHING", "Поиск"), TR("CONNECTING", "Подключение"),
+                           pressPowerRequired ? TR("PRESS POWER", "Нажмите кнопку") :
+                           (authAppKeyReused ? TR("AUTH KEY", "Ключ авторизации") : TR("PRESS POWER", "Нажмите кнопку")),
+                           TR("PAIRING", "Сопряжение")};
   const char* subs[4] = {TR("Turn on the scooter and stay close", "Включите самокат и будьте рядом"),
                          TR("Starting secure handshake", "Устанавливаем защищённую связь"),
-                         TR("Press the scooter power button once", "Нажмите кнопку питания самоката"),
+                         pressPowerRequired ? TR("Press the scooter power button once", "Нажмите кнопку питания самоката") :
+                         (authAppKeyReused ? TR("Reusing saved pairing key", "Используем сохранённый ключ") : TR("Press the scooter power button once", "Нажмите кнопку питания самоката")),
                          TR("Almost there...", "Почти готово...")};
   field(40, 120, 156, titles[phase], 224, 4, power ? COL_WARN : COL_TXT, MC_DATUM, COL_BG);
   field(41, 120, 186, subs[phase], 224, 2, COL_DIM, MC_DATUM, COL_BG);
@@ -3878,6 +3988,10 @@ class ClientCB : public NimBLEClientCallbacks {
     authState = AUTH_IDLE;
     pendingTx = TX_NONE;
     pressPowerRequired = false;
+    authInitReceived = false;
+    authPairConfirmed = false;
+    authAppKeyReused = false;
+    authPingRetries = 0;
   }
 } clientCB;
 
@@ -3932,6 +4046,8 @@ bool scanAndConnect() {
   resetCrypto(std::string(bestName.c_str()));
   rxLen = 0; rxExpected = 0; lastRx = millis(); connected = true; d.valid = 0;
   txCounter = 0; rxCounter = 0; pressPowerRequired = false;
+  authInitReceived = false; authPairConfirmed = false;
+  authAppKeyReused = false; authPingRetries = 0;
   authState = AUTH_WAIT_INIT; pendingTx = TX_INIT; authLastSend = millis();
   d.totalLow = 0; d.totalHigh = 0; d.tripKm = 0; sessionMax = 0;
   brakeUntil = 0;
@@ -4037,7 +4153,9 @@ void loop() {
     lastDraw = now;
     if (authState == AUTH_READY) status("LIVE " + devName, COL_GOOD);
     else if (authState == AUTH_WAIT_INIT) status("AUTH INIT", COL_ACCENT);
-    else if (authState == AUTH_WAIT_PING) status("PRESS POWER", COL_WARN);
+    else if (authState == AUTH_WAIT_PING)
+      status(pressPowerRequired ? "PRESS POWER" : "AUTH KEY",
+             pressPowerRequired ? COL_WARN : COL_ACCENT);
     else if (authState == AUTH_WAIT_PAIR) status("PAIRING", COL_ACCENT);
     else status("NO LINK", COL_BAD);
     drawUi();

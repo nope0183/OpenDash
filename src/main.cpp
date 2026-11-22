@@ -522,7 +522,7 @@ bool decryptPacket(const uint8_t* encrypted, size_t encryptedLength, uint8_t* pl
   } else if (nextCounter > messageCounter) {
     if (!cryptoNext(encrypted + 3, plain + 3, payloadLength, nextCounter)) return false;
     if (plainLength >= 7 && plain[3] == 0x21 && plain[4] == ADDR_APP &&
-        plain[5] == 0x5C && plain[6] == 0x01) {
+        plain[5] == 0x5C && (plain[6] == 0x01 || authAppKeyReused)) {
       setShaKey(randomAppData, randomBleData);
     }
     messageCounter = nextCounter;
